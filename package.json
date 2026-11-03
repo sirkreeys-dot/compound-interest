@@ -1,0 +1,44 @@
+{
+  "name": "fomo-copybot",
+  "version": "1.0.0",
+  "description": "Copy-trading bot using FOMO API signals with Solana (Jupiter) and Base (0x) execution",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test tests/**/*.test.ts",
+    "replay": "tsx scripts/dry-run-replay.ts",
+    "kill": "tsx scripts/kill.ts"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.7",
+    "js-yaml": "^4.1.0",
+    "viem": "^2.21.0",
+    "ws": "^8.18.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.0",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  },
+  "overrides": {
+    "jayson": {
+      "uuid": "11.1.1",
+      "stream-json": "3.8.0"
+    }
+  }
+}

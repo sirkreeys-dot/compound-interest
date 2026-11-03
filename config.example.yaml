@@ -1,0 +1,70 @@
+# Who to copy
+# traderSource: leaderboard (default) | manual
+# Leaderboard uses FOMO GET /v2/leaderboard/{window} — window values from docs: 24h | 7d | 30d | all
+# "Weekly" = 7d. Env overrides: TRADER_SOURCE, LEADERBOARD_WINDOW, LEADERBOARD_TOP_N, LEADERBOARD_REFRESH_HOURS
+traderSource: leaderboard
+
+leaderboard:
+  window: 7d               # FOMO path value (weekly board)
+  topN: 3                  # copy top 3 by default
+  refreshHours: 6          # re-fetch board; dropouts stop new entries but can still close
+
+# Manual list — only used when traderSource: manual
+# Prefer userId (stable). Handle can rename.
+traders: []
+# traders:
+#   - handle: frankdegods
+#     userId: "6dcf7c78-2537-522a-8307-3f9970c081be"
+#     enabled: true
+#     chains: [solana]  # add base only if chains.base / ENABLED_CHAINS includes it
+
+# Which chains this bot will execute on (default: Solana only)
+# Env override: ENABLED_CHAINS=solana   or  ENABLED_CHAINS=solana,base
+chains:
+  solana: true
+  base: false              # keep Base code paths; enable when ready (needs ZEROX_API_KEY)
+  # Robinhood / BSC / others: signals may arrive but execution is not implemented
+
+sizing:
+  mode: fixed_usd          # fixed_usd | percent_of_trader
+  fixedUsd: 2              # default: $2 per copied trade
+  percentOfTrader: 10      # if mode=percent_of_trader: % of trader fill (needs tradeUsd)
+  maxUsdPerTrade: 5        # hard cap per entry (keeps $2 mode bounded)
+  minTraderTradeUsd: 50    # ignore trader fills smaller than this (when tradeUsd known)
+
+filters:
+  marketCapMinUsd: 0
+  marketCapMaxUsd: 0       # 0 = no max
+  firstBuysOnly: false     # if true, only copy the first buy of a new token position
+  allowedChains: [solana]       # must include a chain for it to trade; Base off by default
+  tokenSafety: block            # block | warn | off — Solana freeze authority / transfer hooks
+  blockFreezeAuthority: true
+  blockTransferHooks: true
+
+risk:
+  takeProfitPct: 50        # sell when mark is +50% from our entry (0 = disabled)
+  stopLossPct: 25          # sell when mark is -25% (0 = disabled)
+  maxSlippageBps: 300      # 3%
+  maxChaseBps: 500         # refuse if quote price moved >5% vs signal estimate
+  dailyBudgetUsd: 40       # ~20x $2 entries / day before stop
+  maxOpenPositions: 10
+  cooldownSeconds: 30      # min seconds between our entries
+  copySells: true          # mirror sells only for positions WE opened from that trader
+  simulateBeforeSign: true # Solana: RPC simulateTransaction before any signature (fail closed)
+  simMaxExtraLamports: 50000  # ~0.00005 SOL fee/tolerance beyond expected input
+  simMaxExtraTokenOutflow: 0  # extra raw units allowed on input ATA outflow
+
+quote:
+  solanaNative: So11111111111111111111111111111111111111112   # wrap SOL
+  baseNative: "0x4200000000000000000000000000000000000006"   # WETH on Base
+  preferStableBuys: false
+  solanaStable: EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v  # USDC
+  baseStable: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"     # USDC on Base
+
+poll:
+  alertsRestEnabled: true
+  alertsRestIntervalSec: 20
+  tpSlCheckIntervalSec: 60
+
+logging:
+  level: info              # debug | info | warn | error

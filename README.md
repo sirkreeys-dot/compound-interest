@@ -216,7 +216,7 @@ On **Solana** and **Base**, network fees and priority/inclusion tips are paid **
 ## 6. Install & configure
 
 ```bash
-cd fomo-copybot
+cd compound-interest   # the folder you cloned into
 cp .env.example .env
 cp config.example.yaml config.yaml
 npm install

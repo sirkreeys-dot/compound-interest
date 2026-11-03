@@ -63,8 +63,12 @@ async function main(): Promise<void> {
     }
     await engine.handleAlert(alert);
   }
-  log.info(`Open positions after replay: ${store.listOpen().length}`);
-  log.info(`Daily stats: ${JSON.stringify(store.getDaily())}`);
+  const liveOpen = store.listOpen();
+  const open = store.listOpen({ includeDryRun: true });
+  log.info(
+    `Open positions after replay: ${open.length} including dry-run (${liveOpen.length} live)`,
+  );
+  log.info(`Daily stats (live only): ${JSON.stringify(store.getDaily())}`);
   store.close();
 }
 

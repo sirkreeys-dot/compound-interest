@@ -27,8 +27,6 @@ async function main(): Promise<void> {
     : path.join(root, "config.example.yaml");
   const cfg = loadAppConfig(configPath, env);
   // Replay uses manual fixture traders (no API key required)
-  // Fixtures are historical. Age limit is a live-feed guard, not a replay guard.
-  cfg.filters.maxAlertAgeSec = 0;
   cfg.traderSource = "manual";
   cfg.traders = [
     {
@@ -56,9 +54,7 @@ async function main(): Promise<void> {
 
   const fixturePath = path.join(root, "fixtures", "sample-alerts.json");
   const raw = JSON.parse(fs.readFileSync(fixturePath, "utf8")) as unknown[];
-  log.info(
-    `Replaying ${raw.length} fixture alerts (size=$${cfg.sizing.fixedUsd}, maxAlertAgeSec=0)…`,
-  );
+  log.info(`Replaying ${raw.length} fixture alerts (size=$${cfg.sizing.fixedUsd})…`);
   for (const item of raw) {
     const alert = parseAlert(item);
     if (!alert) {

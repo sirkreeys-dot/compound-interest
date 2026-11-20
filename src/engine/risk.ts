@@ -14,7 +14,7 @@ export type TpSlHandler = (
 ) => Promise<void>;
 
 /**
- * Periodic exits: partial TP1, trailing stop on the remainder, stop-loss, max hold.
+ * Periodic exits: stop-loss, trailing stop once a partial mirror has armed it, max hold.
  * Mark = sell-quote outUsd, or raw outAmount × fresh native/USDC price.
  * Quote failures are counted; after quoteFailWriteoffCount the position is written
  * off and stops counting toward maxOpenPositions.
@@ -46,11 +46,10 @@ export async function runTpSlPass(opts: {
   onTrigger: TpSlHandler;
   tg?: TelegramNotifier;
 }): Promise<void> {
-  const tp = opts.cfg.risk.takeProfitPct;
   const sl = opts.cfg.risk.stopLossPct;
   const trail = opts.cfg.risk.trailingStopPct;
   const hold = opts.cfg.risk.maxHoldMinutes;
-  if (tp <= 0 && sl <= 0 && trail <= 0 && hold <= 0) return;
+  if (sl <= 0 && trail <= 0 && hold <= 0) return;
 
   const positions = opts.store.listOpen({ includeDryRun: opts.dryRun });
   for (const pos of positions) {

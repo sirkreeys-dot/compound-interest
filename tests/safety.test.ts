@@ -261,7 +261,7 @@ describe("safety: failed swap creates no phantom position", () => {
 });
 
 describe("safety: partial sell sizing", () => {
-  it("sells proportional raw amount", async () => {
+  it("a 25% trader sell sells half of our remaining bag", async () => {
     const fake = new FakeExec();
     const { engine, store } = await setup(path.join(tmpRoot, "partial"), true, fake);
     await engine.handleAlert(
@@ -273,13 +273,14 @@ describe("safety: partial sell sizing", () => {
       alert({
         eventId: "p-sell",
         alertType: "sell",
-        tradeUsd: 250, // 25% of 1000
+        tradeUsd: 250, // 25% of the position USD recorded at entry → mirror 50% of ours
       }),
     );
-    assert.equal(fake.lastSellRaw, "250000");
+    assert.equal(fake.lastSellRaw, "500000");
     const after = store.listOpen({ includeDryRun: true })[0];
-    assert.ok(after); // partial remains open
-    assert.equal(after!.quantityRaw, "750000");
+    assert.ok(after);
+    assert.equal(after!.quantityRaw, "500000");
+    assert.equal(after!.trailArmed, true);
     store.close();
   });
 });

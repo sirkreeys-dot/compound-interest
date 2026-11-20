@@ -10,8 +10,8 @@ leaderboard:
   refreshHours: 6          # re-fetch board; dropouts stop new entries but can still close
   minTrades: 0             # skip a row when the API exposes a trade count below this. 0 = off.
                            # If the payload has no trade count, the filter is not applied (logged once).
-  autoDropNegativePnl: false  # optional: stop copying a trader after N of OUR closes are net-negative
-  autoDropMinCloses: 5     # minimum copied closes before auto-drop can fire
+  autoDropNegativePnl: true   # stop new entries once OUR copied closes for that trader are net-negative
+  autoDropMinCloses: 3     # need at least this many live closes before the cutoff can fire
 
 # Manual list — only used when traderSource: manual
 # Prefer userId (stable). Handle can rename.
@@ -48,20 +48,25 @@ filters:
   blockFreezeAuthority: true
   blockTransferHooks: true
   blockMintAuthority: true # block while the mint authority is still active
-  maxAlertAgeSec: 15       # skip buys older than this. 0 disables. Missing ts fails closed when > 0
-  maxTopHolderBps: 0       # 0 = off. Set e.g. 9000 to block when the largest account holds >90%.
-                           # Fail closed while enabled, including when RPC errors.
-                           # api.mainnet-beta.solana.com returns 429 for getTokenLargestAccounts,
-                           # so leave this at 0 unless your RPC actually serves that method.
-                           # AMM pools are often the largest holder — a tight cap blocks normal tokens.
-  roundTripMaxLossBps: 2500 # pre-buy sell quote of the tokens just quoted. Reject above this loss. 0 = off
-  minLiquidityUsd: 0       # optional DexScreener liquidity floor. 0 = off. When on, lookup failure blocks
+  # PAID RPC REQUIRED for the top-holder check.
+  # api.mainnet-beta.solana.com returns HTTP 429 for getTokenLargestAccounts.
+  # The check fails closed, so the public default RPC blocks every buy. It is NOT
+  # disabled automatically — set SOLANA_RPC_URL to an RPC that serves the method.
+  # 9000 = block when one account holds more than 90% of supply. LP is often the
+  # largest holder but rarely above 90% after a token is trading; tighter caps
+  # false-positive on the pool. 0 disables.
+  maxTopHolderBps: 9000
+  roundTripMaxLossBps: 2500 # pre-buy sell quote of the tokens just quoted. Reject above 25% loss. 0 = off
+  # DexScreener liquidity floor. $10k drops pools where a $2 swap is mostly impact.
+  # Lookup failure blocks. 0 disables.
+  minLiquidityUsd: 10000
 
 risk:
-  takeProfitPct: 50        # TP1: mark +50% from our cost (0 = disabled)
-  takeProfitSellFraction: 0.5  # sell half at TP1; the rest uses the trailing stop
-  trailingStopPct: 20      # after TP1, exit the remainder if mark falls 20% from its peak (0 = off)
-  stopLossPct: 25          # full exit when mark is -25% from cost (0 = disabled). Still runs after TP1
+  # No fixed take-profit. A trader sell under 10% of their position is ignored.
+  # A partial sell of 10% up to (but not) 100% sells 50% of OUR remaining bag and
+  # arms the trailing stop. A full exit sells 100% of ours. Unknown fraction → 50%.
+  trailingStopPct: 20      # after the first partial mirror, exit the remainder if mark falls 20% from its peak (0 = off)
+  stopLossPct: 25          # full exit when mark is -25% from our cost (0 = disabled)
   maxHoldMinutes: 0        # optional full exit after this many minutes. 0 = off
   maxSlippageBps: 300      # 3% buy slippage cap
   sellSlippageBps: [300, 1000, 2500]  # sell retry ladder; first success wins

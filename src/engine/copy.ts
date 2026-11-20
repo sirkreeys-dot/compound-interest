@@ -9,7 +9,7 @@ import type { TelegramNotifier } from "../notify/telegram.js";
 import type { Watchlist } from "./watchlist.js";
 import type { FomoRestClient } from "../fomo/client.js";
 import { evaluateAlert } from "./filters.js";
-import { findTraderTokenAmount, resolveSellFraction } from "./sellFraction.js";
+import { findTraderTokenAmount, mapTraderSellToOurFraction, resolveSellFraction } from "./sellFraction.js";
 import { batchSellKey, buysSuppressedBySameBatch, tokenLockKey } from "./batch.js";
 import { log } from "../utils/logger.js";
 import { KeyedMutex, Mutex } from "../utils/mutex.js";
@@ -20,7 +20,6 @@ const CLAIM_ON_SKIP = new Set<SkipReason>([
   "trader_not_watched",
   "unsupported_chain",
   "trader_inactive_alumni",
-  "stale_alert",
   "invalid_token_address",
   "no_token_address",
   "token_safety",
@@ -126,7 +125,12 @@ export class CopyEngine {
         this.store.deleteSellRetry(row.positionId);
         continue;
       }
-      await this.closePosition(pos, row.reason);
+      await this.closePosition(
+        pos,
+        row.reason,
+        undefined,
+        row.ourFraction != null ? { fraction: row.ourFraction } : undefined,
+      );
     }
   }
 
@@ -548,16 +552,44 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
     let fraction = opts?.fraction ?? 1;
     let fractionMethod = "full";
     let fractionDetail = reason;
+    let armTrail = false;
+    let nextTraderTokenAmount: number | null = null;
     if (reason === "trader_sell" && opts?.fraction == null) {
       const resolved = await resolveSellFraction({
         pos: locked,
         alert,
         fomo: this.fomo,
       });
-      fraction = resolved.fraction;
+      nextTraderTokenAmount = resolved.nextTraderTokenAmount;
+      const mapped = mapTraderSellToOurFraction(resolved.fraction);
       fractionMethod = resolved.method;
-      fractionDetail = resolved.detail;
-      log.info(`Sell fraction method=${fractionMethod} fraction=${fraction} (${fractionDetail})`);
+      fractionDetail = `${resolved.detail}. ${mapped.detail}`;
+      const logLine = `Mirror sell method=${fractionMethod} traderFraction=${resolved.fraction ?? "unknown"} ourFraction=${mapped.ourFraction} (${fractionDetail})`;
+      if (resolved.fraction == null) log.warn(logLine);
+      else log.info(logLine);
+      if (mapped.action === "ignore") {
+        if (nextTraderTokenAmount != null) {
+          this.store.setTraderTokenAmount(locked.id, nextTraderTokenAmount);
+        }
+        this.store.revertClosingToOpen(pos.id);
+        log.info(`Ignored trader sell under 10% for ${locked.tokenSymbol ?? locked.tokenAddress}`);
+        return;
+      }
+      fraction = mapped.ourFraction;
+      armTrail = mapped.armTrail && !locked.trailArmed;
+      this.fire(
+        this.tg.notifySellSizing({
+          method: fractionMethod,
+          fraction,
+          detail: fractionDetail,
+        }),
+      );
+    } else if (reason === "trader_sell" && opts?.fraction != null) {
+      // Retry keeps the fraction decided on the first attempt. The alert is gone.
+      fraction = opts.fraction;
+      fractionMethod = "retry";
+      fractionDetail = `retry ourFraction=${opts.fraction}`;
+      armTrail = opts.fraction < 0.999 && !locked.trailArmed;
       this.fire(
         this.tg.notifySellSizing({
           method: fractionMethod,
@@ -566,7 +598,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
         }),
       );
     } else if (opts?.fraction != null && opts.fraction < 0.999) {
-      fractionMethod = "take_profit_partial";
+      fractionMethod = "partial";
       fractionDetail = `fraction=${opts.fraction}`;
     }
 
@@ -574,6 +606,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
       log.error(`Sell aborted: position ${pos.id} has no quantityRaw`);
       this.store.revertClosingToOpen(pos.id);
       if (alert) this.noteSkip(alert, "execution_failed", "no quantityRaw");
+      this.noteMirroredFailure(locked, reason, alert, "no quantityRaw", fraction);
       return;
     }
 
@@ -612,14 +645,14 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
       log.error(`Sell failed: ${err}`);
       this.store.revertClosingToOpen(pos.id);
       if (alert) this.noteSkip(alert, "execution_failed", redactSecrets(err));
-      this.noteMirroredFailure(locked, reason, alert, err);
+      this.noteMirroredFailure(locked, reason, alert, err, fraction);
       return;
     }
     if (!dryRun && result.dryRun) {
       log.error("Sell returned dryRun while LIVE — reverting lock");
       this.store.revertClosingToOpen(pos.id);
       if (alert) this.noteSkip(alert, "execution_failed", "live sell dry-ran");
-      this.noteMirroredFailure(locked, reason, alert, "live sell dry-ran");
+      this.noteMirroredFailure(locked, reason, alert, "live sell dry-ran", fraction);
       return;
     }
 
@@ -648,8 +681,11 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
       solOutLamports: result.solOutLamports ?? null,
       feeLamports: lamports(result.feeLamports),
     });
-    if (!fullyClosed && reason === "take_profit") {
-      this.store.setTp1Done(locked.id);
+    if (nextTraderTokenAmount != null) {
+      this.store.setTraderTokenAmount(locked.id, nextTraderTokenAmount);
+    }
+    if (!fullyClosed && armTrail) {
+      this.store.setTrailArmed(locked.id);
     }
     this.store.deleteSellRetry(locked.id);
 
@@ -706,6 +742,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
     reason: string,
     alert: NormalizedAlert | undefined,
     error: string,
+    ourFraction: number,
   ): void {
     if (!MIRRORED_SELL.has(reason)) return;
     const max = this.cfg.risk.mirroredSellMaxRetries;
@@ -718,7 +755,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
       );
       this.fire(
         this.tg.send(
-          `<b>Mirrored sell gave up</b>\n${pos.tokenSymbol ?? pos.tokenAddress} after ${attempts} attempts.\n${redactSecrets(error).slice(0, 300)}\nPosition stays open for TP/SL.`,
+          `<b>Mirrored sell gave up</b>\n${pos.tokenSymbol ?? pos.tokenAddress} after ${attempts} attempts.\n${redactSecrets(error).slice(0, 300)}\nPosition stays open for stop-loss and the trailing stop.`,
         ),
       );
       return;
@@ -731,6 +768,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
       attempts,
       lastError: redactSecrets(error).slice(0, 500),
       nextAttemptAt: Date.now() + delay,
+      ourFraction: prev?.ourFraction ?? ourFraction,
     });
     log.warn(
       `Queued mirrored sell retry ${attempts}/${max} for ${pos.tokenSymbol ?? pos.id} in ${delay}ms`,

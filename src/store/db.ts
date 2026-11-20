@@ -102,7 +102,8 @@ export class Store {
         attempts INTEGER NOT NULL DEFAULT 0,
         last_error TEXT,
         next_attempt_at INTEGER NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        our_fraction REAL
       );
     `);
     this.migrate();
@@ -133,6 +134,10 @@ export class Store {
       this.db.exec(
         `ALTER TABLE daily_stats ADD COLUMN paper_realized_pnl_usd REAL NOT NULL DEFAULT 0`,
       );
+    }
+    const retryCols = this.db.prepare(`PRAGMA table_info(sell_retries)`).all() as Array<{ name: string }>;
+    if (retryCols.length && !retryCols.some((c) => c.name === "our_fraction")) {
+      this.db.exec(`ALTER TABLE sell_retries ADD COLUMN our_fraction REAL`);
     }
     // Backfill remaining_usd for old rows
     this.db.exec(
@@ -228,7 +233,7 @@ export class Store {
         p.rentPaidLamports ?? null,
         p.rentReclaimedLamports ?? null,
         p.peakMarkUsd ?? null,
-        p.tp1Done ? 1 : 0,
+        p.trailArmed ? 1 : 0,
         p.quoteFailures ?? 0,
       );
   }
@@ -521,7 +526,12 @@ export class Store {
     this.db.prepare(`UPDATE positions SET peak_mark_usd = ? WHERE id = ?`).run(markUsd, id);
   }
 
-  setTp1Done(id: string): void {
+  /**
+   * Arm the trailing stop after the first partial mirrored sell.
+   * Column name tp1_done is historical; it no longer means a fixed take-profit.
+   * Peak is cleared so the next mark seeds the high of the remainder.
+   */
+  setTrailArmed(id: string): void {
     this.db
       .prepare(`UPDATE positions SET tp1_done = 1, peak_mark_usd = NULL WHERE id = ?`)
       .run(id);
@@ -733,18 +743,21 @@ export class Store {
     attempts: number;
     lastError?: string | null;
     nextAttemptAt: number;
+    ourFraction?: number | null;
   }): void {
     const now = new Date().toISOString();
     this.db
       .prepare(
-        `INSERT INTO sell_retries (position_id, event_id, reason, attempts, last_error, next_attempt_at, created_at)
-         VALUES (?,?,?,?,?,?,?)
+        `INSERT INTO sell_retries (
+           position_id, event_id, reason, attempts, last_error, next_attempt_at, created_at, our_fraction
+         ) VALUES (?,?,?,?,?,?,?,?)
          ON CONFLICT(position_id) DO UPDATE SET
            event_id = excluded.event_id,
            reason = excluded.reason,
            attempts = excluded.attempts,
            last_error = excluded.last_error,
-           next_attempt_at = excluded.next_attempt_at`,
+           next_attempt_at = excluded.next_attempt_at,
+           our_fraction = excluded.our_fraction`,
       )
       .run(
         row.positionId,
@@ -754,6 +767,7 @@ export class Store {
         row.lastError ?? null,
         row.nextAttemptAt,
         now,
+        row.ourFraction ?? null,
       );
   }
 
@@ -764,19 +778,13 @@ export class Store {
     attempts: number;
     lastError: string | null;
     nextAttemptAt: number;
+    ourFraction: number | null;
   } | null {
     const row = this.db
       .prepare(`SELECT * FROM sell_retries WHERE position_id = ?`)
       .get(positionId) as Record<string, unknown> | undefined;
     if (!row) return null;
-    return {
-      positionId: String(row.position_id),
-      eventId: row.event_id != null ? String(row.event_id) : null,
-      reason: String(row.reason),
-      attempts: Number(row.attempts),
-      lastError: row.last_error != null ? String(row.last_error) : null,
-      nextAttemptAt: Number(row.next_attempt_at),
-    };
+    return rowToSellRetry(row);
   }
 
   dueSellRetries(nowMs: number): Array<{
@@ -786,18 +794,12 @@ export class Store {
     attempts: number;
     lastError: string | null;
     nextAttemptAt: number;
+    ourFraction: number | null;
   }> {
     const rows = this.db
       .prepare(`SELECT * FROM sell_retries WHERE next_attempt_at <= ? ORDER BY next_attempt_at ASC`)
       .all(nowMs) as Record<string, unknown>[];
-    return rows.map((row) => ({
-      positionId: String(row.position_id),
-      eventId: row.event_id != null ? String(row.event_id) : null,
-      reason: String(row.reason),
-      attempts: Number(row.attempts),
-      lastError: row.last_error != null ? String(row.last_error) : null,
-      nextAttemptAt: Number(row.next_attempt_at),
-    }));
+    return rows.map(rowToSellRetry);
   }
 
   deleteSellRetry(positionId: string): void {
@@ -1028,8 +1030,28 @@ function rowToPosition(row: Record<string, unknown>): OpenPosition {
     rentReclaimedLamports:
       row.rent_reclaimed_lamports != null ? String(row.rent_reclaimed_lamports) : null,
     peakMarkUsd: row.peak_mark_usd != null ? Number(row.peak_mark_usd) : null,
-    tp1Done: Number(row.tp1_done ?? 0) === 1,
+    trailArmed: Number(row.tp1_done ?? 0) === 1,
     quoteFailures: row.quote_failures != null ? Number(row.quote_failures) : 0,
+  };
+}
+
+function rowToSellRetry(row: Record<string, unknown>): {
+  positionId: string;
+  eventId: string | null;
+  reason: string;
+  attempts: number;
+  lastError: string | null;
+  nextAttemptAt: number;
+  ourFraction: number | null;
+} {
+  return {
+    positionId: String(row.position_id),
+    eventId: row.event_id != null ? String(row.event_id) : null,
+    reason: String(row.reason),
+    attempts: Number(row.attempts),
+    lastError: row.last_error != null ? String(row.last_error) : null,
+    nextAttemptAt: Number(row.next_attempt_at),
+    ourFraction: row.our_fraction != null ? Number(row.our_fraction) : null,
   };
 }
 

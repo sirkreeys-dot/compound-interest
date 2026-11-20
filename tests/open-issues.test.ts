@@ -178,14 +178,14 @@ describe("open-issue: FOMO-based sell fraction", () => {
     assert.equal(r.fraction, 1);
   });
 
-  it("falls back to full_exit_fallback when nothing reliable", async () => {
+  it("returns unknown instead of guessing a full exit when nothing reliable", async () => {
     const r = await resolveSellFraction({
       pos: { ...basePos, traderTokenAmountAtEntry: null, traderSizeAtEntryUsd: null },
       fomo: null,
       alert: undefined,
     });
-    assert.equal(r.method, "full_exit_fallback");
-    assert.equal(r.fraction, 1);
+    assert.equal(r.method, "unknown");
+    assert.equal(r.fraction, null);
   });
 });
 

@@ -65,7 +65,10 @@ export interface AppConfig {
     refreshHours: number;
     /** Drop a leaderboard row when it exposes a trade count below this. 0 = off. */
     minTrades: number;
-    /** Stop new entries from traders whose copied closes are net-negative after N closes. */
+    /**
+     * Stop new entries once our copied closes for that trader are net-negative
+     * over autoDropMinCloses. Sells of bags already open still run.
+     */
     autoDropNegativePnl: boolean;
     autoDropMinCloses: number;
   };
@@ -94,8 +97,6 @@ export interface AppConfig {
     blockTransferHooks: boolean;
     /** Block buys while the mint authority is still set. */
     blockMintAuthority: boolean;
-    /** Skip buys older than this many seconds. 0 disables. Missing ts fails closed when > 0. */
-    maxAlertAgeSec: number;
     /** Block when the largest token account holds more than this share. 0 disables. */
     maxTopHolderBps: number;
     /** Block when a sell quote of the buy output loses more than this vs USD in. 0 disables. */
@@ -104,11 +105,10 @@ export interface AppConfig {
     minLiquidityUsd: number;
   };
   risk: {
-    /** TP1 threshold vs cost basis. 0 disables. */
-    takeProfitPct: number;
-    /** Fraction of the bag to sell at TP1. 1 = full exit. Remainder trails. */
-    takeProfitSellFraction: number;
-    /** After TP1 (or immediately if TP is off), exit when mark falls this % from the peak. 0 disables. */
+    /**
+     * After the first partial mirrored sell, exit the remainder when mark falls
+     * this percent from the highest mark since the trail was armed. 0 disables.
+     */
     trailingStopPct: number;
     stopLossPct: number;
     /** Full exit after this many minutes. 0 disables. */
@@ -231,7 +231,8 @@ export interface OpenPosition {
   rentReclaimedLamports?: string | null;
   /** Highest mark seen since the trailing stop was armed. Null until seeded. */
   peakMarkUsd?: number | null;
-  tp1Done?: boolean;
+  /** Set after the first partial mirrored sell. Arms the trailing stop on the remainder. */
+  trailArmed?: boolean;
   quoteFailures?: number;
 }
 
@@ -288,7 +289,6 @@ export type SkipReason =
   | "chase_limit"
   | "execution_failed"
   | "paused"
-  | "stale_alert"
   | "same_batch_sell"
   | "token_cap"
   | "daily_loss_limit"

@@ -16,6 +16,7 @@ import {
   fetchDexScreenerLiquidity,
   fetchLargestHolderAmount,
   inspectSolanaMint,
+  isPublicSolanaRpc,
   type TokenSafetyMode,
 } from "../security/tokenSafety.js";
 import { closeEmptyTokenAccount } from "./closeAta.js";
@@ -278,7 +279,10 @@ export class SolanaExecutor implements Executor {
         fetchFailed: largest.failed,
       });
       if (judged.blocked) {
-        finding.warnings.push(judged.detail);
+        const hint = isPublicSolanaRpc(this.rpcUrl)
+          ? " Public mainnet RPC returns 429 for getTokenLargestAccounts; a paid RPC is required and this check is not disabled."
+          : "";
+        finding.warnings.push(judged.detail + hint);
         if (mode === "block") {
           finding.blocked = true;
           finding.blockReason = "top_holder";

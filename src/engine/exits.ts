@@ -1,6 +1,6 @@
 import type { AppConfig, OpenPosition } from "../types.js";
 
-export type ExitReason = "take_profit" | "stop_loss" | "trailing_stop" | "max_hold";
+export type ExitReason = "stop_loss" | "trailing_stop" | "max_hold";
 
 export type ExitDecision =
   | { type: "hold" }
@@ -8,9 +8,10 @@ export type ExitDecision =
   | { type: "close"; reason: ExitReason; fraction: number };
 
 /**
- * Pure TP1 / trailing / stop / max-hold decision for one marked position.
- * Stop-loss is always a full exit. TP1 sells takeProfitSellFraction (default half)
- * and arms the trailing stop on whatever remains. Max hold is a full exit.
+ * Stop-loss is always a full exit from cost basis.
+ * The trailing stop runs only after a partial mirrored sell has set trailArmed,
+ * and it measures the drop from the highest mark since that arming.
+ * There is no fixed take-profit.
  */
 export function decideExit(opts: {
   pos: OpenPosition;
@@ -33,21 +34,13 @@ export function decideExit(opts: {
 
   const pnlPct = ((markUsd - cost) / cost) * 100;
   const sl = cfg.risk.stopLossPct;
-  const tp = cfg.risk.takeProfitPct;
   const trail = cfg.risk.trailingStopPct;
-  const tpFraction = cfg.risk.takeProfitSellFraction;
 
   if (sl > 0 && pnlPct <= -sl) {
     return { type: "close", reason: "stop_loss", fraction: 1 };
   }
 
-  if (!pos.tp1Done && tp > 0 && pnlPct >= tp) {
-    const fraction = tpFraction > 0 && tpFraction < 0.999 ? tpFraction : 1;
-    return { type: "close", reason: "take_profit", fraction };
-  }
-
-  const trailArmed = Boolean(pos.tp1Done) || (tp <= 0 && trail > 0);
-  if (trailArmed && trail > 0) {
+  if (pos.trailArmed && trail > 0) {
     if (pos.peakMarkUsd == null || !(pos.peakMarkUsd > 0)) {
       return { type: "seed_peak", markUsd };
     }

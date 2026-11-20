@@ -3,13 +3,6 @@ import { isValidTokenAddress } from "../security/addresses.js";
 import type { Store } from "../store/db.js";
 import type { Watchlist, WatchedTrader } from "./watchlist.js";
 
-/** Age of an alert in ms. Accepts unix seconds or milliseconds. Null when ts is missing. */
-export function alertAgeMs(ts: number | null, now = Date.now()): number | null {
-  if (ts == null || !Number.isFinite(ts)) return null;
-  const ms = ts > 0 && ts < 1e12 ? ts * 1000 : ts;
-  return now - ms;
-}
-
 export interface FilterContext {
   cfg: AppConfig;
   store: Store;
@@ -112,21 +105,6 @@ export function evaluateAlert(alert: NormalizedAlert, ctx: FilterContext): Filte
         reason: "chain_disabled_for_trader",
         detail: `${alert.chain} not in trader.chains`,
       };
-    }
-
-    const maxAge = ctx.cfg.filters.maxAlertAgeSec ?? 0;
-    if (maxAge > 0) {
-      const age = alertAgeMs(alert.ts);
-      if (age == null) {
-        return { ok: false, reason: "stale_alert", detail: "missing ts (fail closed)" };
-      }
-      if (age > maxAge * 1000) {
-        return {
-          ok: false,
-          reason: "stale_alert",
-          detail: `${Math.round(age / 1000)}s > maxAlertAgeSec ${maxAge}`,
-        };
-      }
     }
 
     const mc = alert.marketCapUsd;

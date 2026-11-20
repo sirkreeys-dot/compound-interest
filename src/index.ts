@@ -13,6 +13,7 @@ import { ExecutionRouter } from "./execution/index.js";
 import { FomoRestClient } from "./fomo/client.js";
 import { FomoAlertFanout } from "./fomo/ws.js";
 import { TelegramNotifier } from "./notify/telegram.js";
+import { PUBLIC_RPC_HOLDER_WARNING, isPublicSolanaRpc } from "./security/tokenSafety.js";
 import { Store } from "./store/db.js";
 import type { NormalizedAlert } from "./types.js";
 import { KillSwitch } from "./utils/killswitch.js";
@@ -97,6 +98,9 @@ async function main(): Promise<void> {
   log.info(
     `Enabled chains: solana=${cfg.chains.solana} base=${cfg.chains.base} allowedChains=[${cfg.filters.allowedChains.join(",")}]`,
   );
+  if ((cfg.filters.maxTopHolderBps ?? 0) > 0 && isPublicSolanaRpc(env.solanaRpcUrl)) {
+    log.warn(PUBLIC_RPC_HOLDER_WARNING);
+  }
 
   if (!env.fomoApiKey) {
     log.warn("FOMO_API_KEY empty — leaderboard/WS/REST will fail until you set it (see README)");

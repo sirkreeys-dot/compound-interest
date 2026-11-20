@@ -9,10 +9,10 @@ import { CopyEngine } from "../src/engine/copy.js";
 import { buysSuppressedBySameBatch } from "../src/engine/batch.js";
 import { decideExit } from "../src/engine/exits.js";
 import { shouldPollRest } from "../src/engine/polling.js";
-import { alertAgeMs, evaluateAlert } from "../src/engine/filters.js";
+import { evaluateAlert } from "../src/engine/filters.js";
 import { reconcileOpenPositions } from "../src/engine/reconcilePositions.js";
 import { runTpSlPass } from "../src/engine/risk.js";
-import { traderHoldState } from "../src/engine/sellFraction.js";
+import { mapTraderSellToOurFraction, traderHoldState } from "../src/engine/sellFraction.js";
 import { leaderboardTradeCount, Watchlist } from "../src/engine/watchlist.js";
 import type { ExecutionRouter } from "../src/execution/index.js";
 import { parallelSafetyAndOrder } from "../src/execution/solana.js";
@@ -70,6 +70,7 @@ function alert(over: Partial<NormalizedAlert> = {}): NormalizedAlert {
 class FakeExec {
   buys = 0;
   sells = 0;
+  lastSellRaw: string | undefined;
   slippage: number[] = [];
   failSells = 0;
   outUsd: number | null = null;
@@ -102,6 +103,7 @@ class FakeExec {
   }
   async sellToken(req: SwapRequest): Promise<SwapResult> {
     this.sells++;
+    this.lastSellRaw = req.sellAmountRaw;
     this.slippage.push(req.slippageBps);
     if (this.failSells > 0) {
       this.failSells--;
@@ -257,18 +259,17 @@ describe("sim: fresh token account rent is allowed under the ceiling", () => {
   });
 });
 
-describe("staleness, same-batch sells, and chase wording", () => {
-  it("skips buys older than maxAlertAgeSec and missing timestamps", async () => {
+describe("no alert-age skip, same-batch sells", () => {
+  it("does not skip old buys or buys with no timestamp", async () => {
     const { cfg, store, watchlist } = await setup(path.join(tmp, "stale"), true, new FakeExec());
-    cfg.filters.maxAlertAgeSec = 15;
-    const old = evaluateAlert(alert({ eventId: "old", ts: Date.now() - 60_000 }), {
+    const old = evaluateAlert(alert({ eventId: "old", ts: Date.now() - 86_400_000 }), {
       cfg,
       store,
       dryRun: true,
       paused: false,
       watchlist,
     });
-    assert.equal(old.reason, "stale_alert");
+    assert.equal(old.ok, true);
     const missing = evaluateAlert(alert({ eventId: "missing", ts: null }), {
       cfg,
       store,
@@ -276,37 +277,19 @@ describe("staleness, same-batch sells, and chase wording", () => {
       paused: false,
       watchlist,
     });
-    assert.equal(missing.reason, "stale_alert");
-    const fresh = evaluateAlert(alert({ eventId: "fresh", ts: Date.now() }), {
-      cfg,
-      store,
-      dryRun: true,
-      paused: false,
-      watchlist,
-    });
-    assert.equal(fresh.ok, true);
-    cfg.filters.maxAlertAgeSec = 0;
-    const disabled = evaluateAlert(alert({ eventId: "ancient", ts: 1_700_000_000_000 }), {
-      cfg,
-      store,
-      dryRun: true,
-      paused: false,
-      watchlist,
-    });
-    assert.equal(disabled.ok, true);
-    assert.ok((alertAgeMs(1_700_000_000) ?? 0) > 0);
-    const skips = store.listSkips();
+    assert.equal(missing.ok, true);
     store.close();
-    assert.ok(Array.isArray(skips));
   });
 
-  it("records a stale skip and does not buy", async () => {
-    const { engine, store, cfg } = await setup(path.join(tmp, "stale-eng"), true, new FakeExec());
-    cfg.filters.maxAlertAgeSec = 15;
-    await engine.handleAlert(alert({ eventId: "stale-1", ts: Date.now() - 120_000 }));
-    assert.equal(store.listOpen({ includeDryRun: true }).length, 0);
-    assert.equal(store.listSkips(10).some((s) => s.reason === "stale_alert"), true);
-    assert.equal(store.hasEvent("stale-1"), true);
+  it("still dedupes a replayed event id after it was claimed", async () => {
+    const fake = new FakeExec();
+    const { engine, store } = await setup(path.join(tmp, "stale-eng"), true, fake);
+    const oldBuy = alert({ eventId: "old-buy", ts: Date.now() - 86_400_000 });
+    await engine.handleAlert(oldBuy);
+    await engine.handleAlert(oldBuy);
+    assert.equal(fake.buys, 1);
+    assert.equal(store.listOpen({ includeDryRun: true }).length, 1);
+    assert.equal(store.hasEvent("old-buy"), true);
     store.close();
   });
 
@@ -332,7 +315,7 @@ describe("staleness, same-batch sells, and chase wording", () => {
 describe("exits: partial TP, trailing stop, max hold, slippage, retries", () => {
   const base = cfgManual();
 
-  it("sells the TP1 fraction, then trails the remainder", () => {
+  it("does not take profit, and trails only after a partial mirror arms it", () => {
     const pos: OpenPosition = {
       id: "p",
       traderUserId: "uid-1",
@@ -353,20 +336,23 @@ describe("exits: partial TP, trailing stop, max hold, slippage, retries", () => 
       status: "dry_open",
       isDryRun: true,
     };
-    const tp = decideExit({ pos, markUsd: 3, cfg: base });
-    assert.equal(tp.type, "close");
-    if (tp.type === "close") {
-      assert.equal(tp.reason, "take_profit");
-      assert.equal(tp.fraction, 0.5);
-    }
+    assert.equal("takeProfitPct" in base.risk, false);
+    const up = decideExit({ pos, markUsd: 4, cfg: base });
+    assert.equal(up.type, "hold");
+    const unarmedDip = decideExit({
+      pos: { ...pos, peakMarkUsd: 4 },
+      markUsd: 3,
+      cfg: base,
+    });
+    assert.equal(unarmedDip.type, "hold");
     const armed = decideExit({
-      pos: { ...pos, tp1Done: true, remainingUsd: 1, peakMarkUsd: null },
+      pos: { ...pos, trailArmed: true, remainingUsd: 1, peakMarkUsd: null },
       markUsd: 1.6,
       cfg: base,
     });
     assert.equal(armed.type, "seed_peak");
     const trail = decideExit({
-      pos: { ...pos, tp1Done: true, remainingUsd: 1, peakMarkUsd: 1.6 },
+      pos: { ...pos, trailArmed: true, remainingUsd: 1, peakMarkUsd: 1.6 },
       markUsd: 1.2,
       cfg: base,
     });
@@ -561,6 +547,80 @@ describe("telegram /close /writeoff /stats stay inside the authorized chat", () 
   });
 });
 
+describe("mirrored trader sells", () => {
+  it("maps under 10%, partial, full, and unknown", () => {
+    assert.equal(mapTraderSellToOurFraction(0.05).action, "ignore");
+    assert.equal(mapTraderSellToOurFraction(0.099).action, "ignore");
+    const partial = mapTraderSellToOurFraction(0.1);
+    assert.equal(partial.action, "sell");
+    assert.equal(partial.ourFraction, 0.5);
+    assert.equal(partial.armTrail, true);
+    const mid = mapTraderSellToOurFraction(0.99);
+    assert.equal(mid.ourFraction, 0.5);
+    const full = mapTraderSellToOurFraction(1);
+    assert.equal(full.ourFraction, 1);
+    assert.equal(full.armTrail, false);
+    const unknown = mapTraderSellToOurFraction(null);
+    assert.equal(unknown.ourFraction, 0.5);
+    assert.equal(unknown.armTrail, true);
+  });
+
+  it("ignores a sell under 10% and does not arm the trail", async () => {
+    const fake = new FakeExec();
+    const { engine, store } = await setup(path.join(tmp, "mirror-small"), true, fake);
+    await engine.handleAlert(alert({ eventId: "ms-buy", tradeUsd: 1000, positionValueUsd: 1000 }));
+    await engine.handleAlert(alert({ eventId: "ms-sell", alertType: "sell", tradeUsd: 50 }));
+    assert.equal(fake.sells, 0);
+    const open = store.listOpen({ includeDryRun: true })[0]!;
+    assert.equal(open.quantityRaw, "1000000");
+    assert.equal(open.trailArmed, false);
+    store.close();
+  });
+
+  it("sells half of ours on a 10–99% trader sell and arms the trail", async () => {
+    const fake = new FakeExec();
+    const { engine, store } = await setup(path.join(tmp, "mirror-partial"), true, fake);
+    await engine.handleAlert(alert({ eventId: "mp-buy", tradeUsd: 1000, positionValueUsd: 1000 }));
+    await engine.handleAlert(alert({ eventId: "mp-sell", alertType: "sell", tradeUsd: 100 }));
+    assert.equal(fake.lastSellRaw, "500000");
+    const open = store.listOpen({ includeDryRun: true })[0]!;
+    assert.equal(open.quantityRaw, "500000");
+    assert.equal(open.trailArmed, true);
+    assert.equal(open.peakMarkUsd, null);
+    store.close();
+  });
+
+  it("sells the whole bag when the trader fully exits", async () => {
+    const fake = new FakeExec();
+    const { engine, store } = await setup(path.join(tmp, "mirror-full"), true, fake);
+    await engine.handleAlert(alert({ eventId: "mf-buy", tradeUsd: 1000, positionValueUsd: 1000 }));
+    const id = store.listOpen({ includeDryRun: true })[0]!.id;
+    await engine.handleAlert(alert({ eventId: "mf-sell", alertType: "sell", tradeUsd: 1000 }));
+    assert.equal(store.listOpen({ includeDryRun: true }).length, 0);
+    assert.equal(store.getPosition(id)?.status, "dry_closed");
+    store.close();
+  });
+
+  it("sells half when the trader fraction cannot be determined", async () => {
+    const fake = new FakeExec();
+    const { engine, store } = await setup(path.join(tmp, "mirror-unknown"), true, fake);
+    await engine.handleAlert(alert({ eventId: "mu-buy", tradeUsd: 1000, positionValueUsd: 1000 }));
+    await engine.handleAlert(
+      alert({
+        eventId: "mu-sell",
+        alertType: "sell",
+        tradeUsd: null,
+        positionValueUsd: null,
+        usdValue: null,
+      }),
+    );
+    const open = store.listOpen({ includeDryRun: true })[0]!;
+    assert.equal(open.quantityRaw, "500000");
+    assert.equal(open.trailArmed, true);
+    store.close();
+  });
+});
+
 describe("rebuys, per-token cap, and sell-all", () => {
   it("merges adds into one position and caps per token", async () => {
     const fake = new FakeExec();
@@ -625,6 +685,49 @@ describe("leaderboard filters and auto-drop", () => {
     assert.equal(leaderboardTradeCount({ trades: 12 }), 12);
     assert.equal(leaderboardTradeCount({ tradeCount: "4" }), 4);
     assert.equal(leaderboardTradeCount({ handle: "x" }), null);
+  });
+
+  it("default cutoff needs 3 net-negative closes and does not fire at 2", async () => {
+    const dir = path.join(tmp, "drop-default");
+    fs.rmSync(dir, { recursive: true, force: true });
+    const cfg = cfgManual();
+    assert.equal(cfg.leaderboard.autoDropNegativePnl, true);
+    assert.equal(cfg.leaderboard.autoDropMinCloses, 3);
+    const store = new Store(dir);
+    const closed = (id: string, pnl: number): OpenPosition => ({
+      id,
+      traderUserId: "uid-1",
+      traderHandle: "alpha",
+      tradeId: null,
+      chain: "solana",
+      tokenAddress: MINT_A,
+      tokenSymbol: "T",
+      entryUsd: 2,
+      sizeUsd: 2,
+      remainingUsd: 0,
+      quantityRaw: "0",
+      entryPriceUsd: null,
+      traderSizeAtEntryUsd: null,
+      traderTokenAmountAtEntry: null,
+      openedAt: new Date().toISOString(),
+      sourceEventId: id,
+      status: "closed",
+      isDryRun: false,
+      realizedPnlUsd: pnl,
+    });
+    store.insertPosition(closed("d1", -1));
+    store.insertPosition(closed("d2", -1));
+    const early = new Watchlist(cfg, null, undefined, store);
+    await early.start();
+    assert.equal(early.listActive().some((t) => t.userId === "uid-1"), true);
+    early.stop();
+    store.insertPosition(closed("d3", -0.4));
+    const later = new Watchlist(cfg, null, undefined, store);
+    await later.start();
+    assert.equal(later.listActive().some((t) => t.userId === "uid-1"), false);
+    assert.equal(later.listActive().some((t) => t.userId === "uid-2"), true);
+    later.stop();
+    store.close();
   });
 
   it("drops a trader after N net-negative copied closes", async () => {
@@ -1011,11 +1114,21 @@ describe("reconcile, pnl, daily loss, rest polling, close-account ix", () => {
     assert.equal(cfg.sizing.maxUsdPerTrade, 5);
     assert.equal(cfg.risk.dailyBudgetUsd, 40);
     assert.equal(cfg.leaderboard.window, "30d");
-    assert.equal(cfg.filters.maxAlertAgeSec, 15);
-    assert.equal(cfg.filters.maxTopHolderBps, 0);
+    assert.equal(cfg.filters.maxTopHolderBps, 9000);
+    assert.equal(cfg.filters.minLiquidityUsd, 10_000);
     assert.equal(cfg.filters.blockMintAuthority, true);
+    assert.equal(cfg.filters.blockFreezeAuthority, true);
+    assert.equal(cfg.filters.roundTripMaxLossBps, 2500);
+    assert.equal(cfg.leaderboard.autoDropNegativePnl, true);
+    assert.equal(cfg.leaderboard.autoDropMinCloses, 3);
+    assert.equal("maxAlertAgeSec" in cfg.filters, false);
+    assert.equal("takeProfitPct" in cfg.risk, false);
+    assert.equal("takeProfitSellFraction" in cfg.risk, false);
     assert.equal(cfg.risk.simMaxOverheadLamports, 3_000_000);
-    assert.equal(cfg.risk.takeProfitSellFraction, 0.5);
+    assert.equal(cfg.risk.stopLossPct, 25);
+    assert.equal(cfg.risk.trailingStopPct, 20);
+    assert.equal(cfg.risk.dailyLossLimitUsd, 20);
+    assert.equal(cfg.risk.quoteFailWriteoffCount, 5);
     assert.equal(cfg.poll.alertsRestIntervalSec, 90);
     assert.equal(cfg.poll.alertsRestOnlyWhenWsDown, true);
     assert.equal(cfg.poll.tpSlCheckIntervalSec, 15);

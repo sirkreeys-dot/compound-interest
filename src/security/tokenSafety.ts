@@ -23,6 +23,19 @@ export interface TokenSafetyFinding {
 }
 
 const TOKEN_PROGRAM = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+
+/** The default public Solana RPC. It rejects getTokenLargestAccounts with HTTP 429. */
+export function isPublicSolanaRpc(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === "api.mainnet-beta.solana.com";
+  } catch {
+    return false;
+  }
+}
+
+export const PUBLIC_RPC_HOLDER_WARNING =
+  "Top-holder check is ON but SOLANA_RPC_URL is the public mainnet endpoint (api.mainnet-beta.solana.com). That RPC returns HTTP 429 for getTokenLargestAccounts, and this check fails closed, so every buy will be blocked. Point SOLANA_RPC_URL at a paid RPC that serves getTokenLargestAccounts. The check is not disabled.";
 const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
 export async function inspectSolanaMint(

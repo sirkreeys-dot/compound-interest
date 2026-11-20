@@ -29,16 +29,16 @@ const configSchema = z.object({
       topN: z.number().int().positive().default(3),
       refreshHours: z.number().positive().default(6),
       minTrades: z.number().int().nonnegative().default(0),
-      autoDropNegativePnl: z.boolean().default(false),
-      autoDropMinCloses: z.number().int().positive().default(5),
+      autoDropNegativePnl: z.boolean().default(true),
+      autoDropMinCloses: z.number().int().positive().default(3),
     })
     .default({
       window: "30d",
       topN: 3,
       refreshHours: 6,
       minTrades: 0,
-      autoDropNegativePnl: false,
-      autoDropMinCloses: 5,
+      autoDropNegativePnl: true,
+      autoDropMinCloses: 3,
     }),
   traders: z
     .array(
@@ -72,14 +72,11 @@ const configSchema = z.object({
     blockFreezeAuthority: z.boolean().default(true),
     blockTransferHooks: z.boolean().default(true),
     blockMintAuthority: z.boolean().default(true),
-    maxAlertAgeSec: z.number().int().nonnegative().default(15),
-    maxTopHolderBps: z.number().int().nonnegative().default(0),
+    maxTopHolderBps: z.number().int().nonnegative().default(9000),
     roundTripMaxLossBps: z.number().int().nonnegative().default(2500),
-    minLiquidityUsd: z.number().nonnegative().default(0),
+    minLiquidityUsd: z.number().nonnegative().default(10_000),
   }),
   risk: z.object({
-    takeProfitPct: z.number().nonnegative().default(50),
-    takeProfitSellFraction: z.number().gt(0).max(1).default(0.5),
     trailingStopPct: z.number().nonnegative().default(20),
     stopLossPct: z.number().nonnegative().default(25),
     maxHoldMinutes: z.number().int().nonnegative().default(0),

@@ -2,11 +2,16 @@
  * Solana swaps via Jupiter Swap API v2: GET /order (+ optional POST /execute).
  * LIVE path: validate order → simulate balances → pending ledger → sign → execute.
  */
-import { Keypair, VersionedTransaction } from "@solana/web3.js";
+import { Connection, Keypair, VersionedTransaction } from "@solana/web3.js";
 import bs58 from "bs58";
 import { randomUUID } from "node:crypto";
 import type { EnvConfig } from "../config.js";
 import { validateJupiterOrder } from "../security/jupiterTx.js";
+import {
+  accountKeysFromLoadedMessage,
+  inspectSwapInstructions,
+} from "../security/programAllowlist.js";
+import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchTimeout } from "../utils/http.js";
 import { redactSecrets } from "../security/redact.js";
 import { simulateAndValidateSwap } from "../security/simulateSwap.js";
 import { roundTripRejection } from "../security/roundTrip.js";
@@ -30,6 +35,17 @@ import type { Executor, SwapRequest, SwapResult } from "./types.js";
 const JUP_BASE = "https://api.jup.ag/swap/v2";
 
 /** Start both promises before awaiting either. Safety never signs; /order never signs. */
+/** Reject a buy unless Jupiter reported an input USD value inside the cap plus a small tolerance. */
+export function jupiterInUsdAllowed(
+  inUsd: number | null | undefined,
+  maxUsdPerTrade: number,
+  toleranceBps: number,
+): boolean {
+  if (inUsd == null || !(inUsd > 0) || !Number.isFinite(inUsd)) return false;
+  const cap = maxUsdPerTrade * (1 + Math.max(0, toleranceBps) / 10_000);
+  return inUsd <= cap;
+}
+
 export function parallelSafetyAndOrder<A, B>(
   safety: () => Promise<A>,
   order: () => Promise<B>,
@@ -146,7 +162,7 @@ export class SolanaExecutor implements Executor {
     if (opts.taker) params.set("taker", opts.taker);
     const headers: Record<string, string> = {};
     if (this.apiKey) headers["x-api-key"] = this.apiKey;
-    const orderRes = await fetch(`${JUP_BASE}/order?${params}`, { headers });
+    const orderRes = await fetchTimeout(`${JUP_BASE}/order?${params}`, { headers }, QUOTE_TIMEOUT_MS);
     if (!orderRes.ok) {
       const t = await orderRes.text();
       return {
@@ -202,6 +218,7 @@ export class SolanaExecutor implements Executor {
     buyToken: string,
     outAmount: string | undefined,
     sellUsd: number,
+    live: boolean,
   ): Promise<string | null> {
     const max = this.cfg.filters.roundTripMaxLossBps ?? 0;
     if (!(max > 0)) return null;
@@ -213,7 +230,7 @@ export class SolanaExecutor implements Executor {
       outputMint: this.cfg.quote.solanaNative,
       amount: outAmount,
       slippageBps: this.cfg.risk.maxSlippageBps,
-      taker: null,
+      taker: this.keypair ? this.keypair.publicKey.toBase58() : null,
     });
     if (!quoted.ok) return `round_trip: sell quote failed (fail closed): ${quoted.error}`;
     let outUsd =
@@ -229,7 +246,49 @@ export class SolanaExecutor implements Executor {
       });
       outUsd = valued?.usd ?? null;
     }
-    return roundTripRejection(sellUsd, outUsd, max);
+    const quoteErr = roundTripRejection(sellUsd, outUsd, max);
+    if (quoteErr) return quoteErr;
+    if (!this.keypair) {
+      // No wallet: Jupiter will not build a taker-specific sell, so dry-run cannot simulate it.
+      return null;
+    }
+    if (!quoted.order.transaction) {
+      if (live) return "round_trip: sell order had no transaction to simulate (fail closed)";
+      return null;
+    }
+    return this.simulateRoundTripTx(quoted.order.transaction, live);
+  }
+
+  /**
+   * Simulate the round-trip sell. Never signs or broadcasts it.
+   * Dry-run without a key never reaches here (no taker, no transaction).
+   */
+  private async simulateRoundTripTx(txB64: string, live: boolean): Promise<string | null> {
+    let tx: VersionedTransaction;
+    try {
+      tx = VersionedTransaction.deserialize(Buffer.from(txB64, "base64"));
+    } catch {
+      return "round_trip: sell transaction did not deserialize (fail closed)";
+    }
+    const guarded = await this.guardSwapTx(tx);
+    if (!guarded.ok) return `round_trip: ${guarded.error}`;
+    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+      if (live) return "round_trip: cannot simulate sell on loopback RPC (fail closed)";
+      return null;
+    }
+    try {
+      const conn = new Connection(this.rpcUrl, "confirmed");
+      const sim = await conn.simulateTransaction(tx, {
+        sigVerify: false,
+        replaceRecentBlockhash: true,
+      });
+      if (sim.value.err) {
+        return `round_trip: sell simulation failed (fail closed): ${JSON.stringify(sim.value.err)}`;
+      }
+    } catch (e) {
+      return `round_trip: sell simulation threw (fail closed): ${e instanceof Error ? e.message : String(e)}`;
+    }
+    return null;
   }
 
   private feeFields(
@@ -392,7 +451,12 @@ export class SolanaExecutor implements Executor {
       }
 
       if (side === "buy") {
-        const roundTripError = await this.roundTripError(req.buyToken, order.outAmount, req.sellUsd);
+        const roundTripError = await this.roundTripError(
+          req.buyToken,
+          order.outAmount,
+          req.sellUsd,
+          !req.dryRun,
+        );
         if (roundTripError) {
           return {
             ok: false,
@@ -404,6 +468,20 @@ export class SolanaExecutor implements Executor {
             inAmountRaw: order.inAmount ?? amount,
             pendingId,
             ...this.feeFields(order, req, side),
+          };
+        }
+      }
+
+      if (side === "buy") {
+        const tolBps = this.cfg.risk.inUsdToleranceBps ?? 200;
+        if (!jupiterInUsdAllowed(order.inUsdValue, this.cfg.sizing.maxUsdPerTrade, tolBps)) {
+          return {
+            ok: false,
+            dryRun: req.dryRun,
+            error: `in_usd: Jupiter inUsdValue ${order.inUsdValue ?? "missing"} exceeds maxUsdPerTrade ${this.cfg.sizing.maxUsdPerTrade} plus ${tolBps}bps`,
+            quoteSummary: summary,
+            outUsd,
+            pendingId,
           };
         }
       }
@@ -458,6 +536,17 @@ export class SolanaExecutor implements Executor {
       }
 
       const tx: VersionedTransaction = validated.tx;
+      const guarded = await this.guardSwapTx(tx);
+      if (!guarded.ok) {
+        this.failPending(pendingId, guarded.error);
+        return {
+          ok: false,
+          dryRun: false,
+          error: redactSecrets(guarded.error),
+          quoteSummary: summary,
+          pendingId,
+        };
+      }
 
       // Pre-sign simulation (fail closed). Skip only when explicitly disabled.
       if (this.cfg.risk.simulateBeforeSign !== false) {
@@ -485,6 +574,7 @@ export class SolanaExecutor implements Executor {
           maxOverheadLamports: this.cfg.risk.simMaxOverheadLamports ?? 3_000_000,
           reportedFeeLamports: this.reportedFees(order),
           maxExtraTokenOutflow: BigInt(this.cfg.risk.simMaxExtraTokenOutflow ?? 0),
+          extraAccountKeys: guarded.accountKeys,
         });
         if (!sim.ok) {
           this.failPending(pendingId, sim.error);
@@ -498,8 +588,8 @@ export class SolanaExecutor implements Executor {
         }
       }
 
-      // Ensure pending row exists before broadcast (copy engine usually creates it)
-      if (side === "buy" && this.store) {
+      // Ensure pending row exists before broadcast (buys and sells).
+      if (this.store && (side === "buy" || side === "sell")) {
         if (!pendingId) {
           pendingId = randomUUID();
           this.store.insertPendingSwap({
@@ -509,7 +599,7 @@ export class SolanaExecutor implements Executor {
             sourceEventId: req.sourceEventId ?? null,
             traderUserId: req.traderUserId ?? null,
             traderHandle: req.traderHandle ?? null,
-            tokenAddress: req.buyToken,
+            tokenAddress: side === "sell" ? req.sellToken : req.buyToken,
             tokenSymbol: req.tokenSymbol ?? null,
             sizeUsd: req.sellUsd,
             sellToken: req.sellToken,
@@ -526,16 +616,63 @@ export class SolanaExecutor implements Executor {
         }
       }
 
+      try {
+        if (req.beforeSign) await req.beforeSign();
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        this.failPending(pendingId, msg);
+        return { ok: false, dryRun: false, error: redactSecrets(msg), quoteSummary: summary, pendingId };
+      }
       tx.sign([this.keypair!]);
       const signed = Buffer.from(tx.serialize()).toString("base64");
+      const signature = bs58.encode(tx.signatures[0]!);
+      if (pendingId && this.store) {
+        this.store.updatePendingSwap(pendingId, {
+          status: "broadcast",
+          txSignature: signature,
+          notes: `signed_before_execute requestId=${order.requestId ?? ""}`,
+        });
+      }
 
-      const execRes = await fetch(`${JUP_BASE}/execute`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...headers },
-        body: JSON.stringify({ signedTransaction: signed, requestId: order.requestId }),
-      });
+      const execRes = await fetchTimeout(
+        `${JUP_BASE}/execute`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...headers },
+          body: JSON.stringify({ signedTransaction: signed, requestId: order.requestId }),
+        },
+        EXECUTE_TIMEOUT_MS,
+      );
       if (!execRes.ok) {
         const t = await execRes.text();
+        const landed = await this.signatureOutcome(signature);
+        if (landed === "success") {
+          if (pendingId && this.store) {
+            this.store.updatePendingSwap(pendingId, { status: "confirmed", txSignature: signature });
+          }
+          return {
+            ok: true,
+            dryRun: false,
+            txHash: signature,
+            outAmountRaw: order.outAmount,
+            inAmountRaw: order.inAmount ?? amount,
+            outUsd,
+            quoteSummary: summary,
+            pendingId,
+            ...this.feeFields(order, req, side),
+          };
+        }
+        if (landed === "pending") {
+          return {
+            ok: false,
+            dryRun: false,
+            inFlight: true,
+            txHash: signature,
+            error: "sell_in_flight: signature not confirmed failed; not signing another transaction",
+            quoteSummary: summary,
+            pendingId,
+          };
+        }
         this.failPending(pendingId, `Jupiter /execute ${execRes.status}`);
         return {
           ok: false,
@@ -607,6 +744,53 @@ export class SolanaExecutor implements Executor {
         error: redactSecrets(msg),
         pendingId,
       };
+    }
+  }
+
+  private async guardSwapTx(
+    tx: VersionedTransaction,
+  ): Promise<{ ok: true; accountKeys: import("@solana/web3.js").PublicKey[] } | { ok: false; error: string }> {
+    if (!this.keypair) return { ok: false, error: "tx: no wallet" };
+    const lookups = tx.message.addressTableLookups ?? [];
+    const tables = [];
+    if (lookups.length) {
+      if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+        return { ok: false, error: "tx: cannot resolve address lookup tables (fail closed)" };
+      }
+      const conn = new Connection(this.rpcUrl, "confirmed");
+      for (const lookup of lookups) {
+        const loaded = await conn.getAddressLookupTable(lookup.accountKey);
+        if (!loaded.value) {
+          return {
+            ok: false,
+            error: `tx: lookup table ${lookup.accountKey.toBase58()} missing (fail closed)`,
+          };
+        }
+        tables.push(loaded.value);
+      }
+    }
+    const accountKeys = accountKeysFromLoadedMessage(tx, tables);
+    if (!accountKeys) return { ok: false, error: "tx: could not resolve account keys (fail closed)" };
+    return inspectSwapInstructions({
+      tx,
+      accountKeys,
+      ourPubkey: this.keypair.publicKey,
+      allowlist: this.cfg.risk.solanaProgramAllowlist ?? [],
+    });
+  }
+
+  private async signatureOutcome(sig: string): Promise<"success" | "failed" | "pending"> {
+    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) return "pending";
+    try {
+      const conn = new Connection(this.rpcUrl, "confirmed");
+      const res = await conn.getSignatureStatuses([sig]);
+      const st = res.value?.[0];
+      if (!st) return "pending";
+      if (st.err) return "failed";
+      if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") return "success";
+      return "pending";
+    } catch {
+      return "pending";
     }
   }
 

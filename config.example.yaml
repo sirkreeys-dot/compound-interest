@@ -86,7 +86,13 @@ risk:
   simMaxExtraTokenOutflow: 0       # extra raw units allowed on input ATA outflow
   closeEmptyTokenAccount: true     # after a full Solana exit, close the empty ATA and reclaim rent
   quoteFailWriteoffCount: 5        # consecutive failed TP/SL quotes → written off
-  mirroredSellMaxRetries: 4        # failed trader-sell attempts before leaving the position to TP/SL
+  mirroredSellMaxRetries: 4        # failed exit attempts (mirror, stop-loss, trail) before alerting and stopping
+  inUsdToleranceBps: 200           # Jupiter inUsdValue may exceed maxUsdPerTrade by 2%
+  solPriceDivergenceBps: 250       # Jupiter vs CoinGecko SOL/USD; wider than this refuses the buy
+  # solanaProgramAllowlist defaults in code. It is the top-level programs seen on a
+  # public Jupiter /order (Compute Budget, System, Token, Token-2022, ATA, Jupiter v6)
+  # plus DEX programs Jupiter sometimes calls directly. JupiterZ co-signed orders are
+  # not included: their fee payer is not our wallet.
 
 quote:
   solanaNative: So11111111111111111111111111111111111111112   # wrap SOL

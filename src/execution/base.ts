@@ -241,6 +241,23 @@ export class BaseExecutor implements Executor {
       }
       void spender;
 
+      try {
+        await this.publicClient!.call({
+          account: this.account!.address,
+          to: ZEROX_ALLOWANCE_HOLDER_CANCUN as Address,
+          data: tx.data as Hex,
+          value: tx.value ? BigInt(tx.value) : 0n,
+        });
+      } catch (e) {
+        return {
+          ok: false,
+          dryRun: false,
+          error: redactSecrets(
+            `base sim failed (fail closed): ${e instanceof Error ? e.message : String(e)}`,
+          ),
+          quoteSummary: summary,
+        };
+      }
       const hash = await this.walletClient!.sendTransaction({
         to: ZEROX_ALLOWANCE_HOLDER_CANCUN as Address,
         data: tx.data as Hex,

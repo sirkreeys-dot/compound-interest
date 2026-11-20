@@ -103,6 +103,8 @@ export interface AppConfig {
     roundTripMaxLossBps: number;
     /** Block when external liquidity is below this USD. 0 disables. Fail closed when enabled. */
     minLiquidityUsd: number;
+    /** Block Token-2022 transfer fees above this many bps. */
+    maxTransferFeeBps: number;
   };
   risk: {
     /**
@@ -159,6 +161,12 @@ export interface AppConfig {
     quoteFailWriteoffCount: number;
     /** Failed mirrored-sell attempts (including the first) before giving up on that event. */
     mirroredSellMaxRetries: number;
+    /** Jupiter inUsdValue may exceed maxUsdPerTrade by this many bps. */
+    inUsdToleranceBps: number;
+    /** Two SOL/USD sources may differ by at most this many bps. */
+    solPriceDivergenceBps: number;
+    /** Top-level programs allowed in a signed Jupiter transaction. */
+    solanaProgramAllowlist: string[];
   };
   quote: {
     solanaNative: string;
@@ -242,6 +250,8 @@ export interface DailyStats {
   realizedPnlUsd: number;
   /** Paper PnL from DRY_RUN closes. Does not affect the live loss limit. */
   paperRealizedPnlUsd: number;
+  /** Paper notional spent while DRY_RUN. Kept off spent_usd. */
+  paperSpentUsd: number;
   trades: number;
 }
 

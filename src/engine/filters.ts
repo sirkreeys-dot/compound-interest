@@ -198,14 +198,13 @@ export function evaluateAlert(alert: NormalizedAlert, ctx: FilterContext): Filte
     // (date = YYYY-MM-DD from toISOString). They reset at 00:00 UTC.
     // Dry-run does not inflate live spent_usd. Paper losses use a separate column.
     const daily = ctx.store.getDaily();
-    if (!ctx.dryRun) {
-      if (daily.spentUsd + sizeUsd > ctx.cfg.risk.dailyBudgetUsd) {
-        return {
-          ok: false,
-          reason: "daily_budget",
-          detail: `spent ${daily.spentUsd} + ${sizeUsd} > ${ctx.cfg.risk.dailyBudgetUsd} (resets 00:00 UTC)`,
-        };
-      }
+    const spent = ctx.dryRun ? daily.paperSpentUsd : daily.spentUsd;
+    if (spent + sizeUsd > ctx.cfg.risk.dailyBudgetUsd) {
+      return {
+        ok: false,
+        reason: "daily_budget",
+        detail: `spent ${spent} + ${sizeUsd} > ${ctx.cfg.risk.dailyBudgetUsd} (resets 00:00 UTC)`,
+      };
     }
     const lossLimit = ctx.cfg.risk.dailyLossLimitUsd ?? 0;
     if (lossLimit > 0) {

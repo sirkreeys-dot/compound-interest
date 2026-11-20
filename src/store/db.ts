@@ -95,6 +95,10 @@ export class Store {
         side TEXT,
         is_dry_run INTEGER NOT NULL DEFAULT 0
       );
+      CREATE TABLE IF NOT EXISTS fill_dedupe (
+        dedupe_key TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS sell_retries (
         position_id TEXT PRIMARY KEY,
         event_id TEXT,
@@ -134,6 +138,10 @@ export class Store {
       this.db.exec(
         `ALTER TABLE daily_stats ADD COLUMN paper_realized_pnl_usd REAL NOT NULL DEFAULT 0`,
       );
+    }
+    const dailyCols2 = this.db.prepare(`PRAGMA table_info(daily_stats)`).all() as Array<{ name: string }>;
+    if (!dailyCols2.some((c) => c.name === "paper_spent_usd")) {
+      this.db.exec(`ALTER TABLE daily_stats ADD COLUMN paper_spent_usd REAL NOT NULL DEFAULT 0`);
     }
     const retryCols = this.db.prepare(`PRAGMA table_info(sell_retries)`).all() as Array<{ name: string }>;
     if (retryCols.length && !retryCols.some((c) => c.name === "our_fraction")) {
@@ -286,15 +294,19 @@ export class Store {
     return rows.map(rowToPosition);
   }
 
-  /** Open positions whose symbol or address contains the query (case-insensitive). */
+  /**
+   * Exact mint, or an exact symbol when it matches one open position.
+   * Substring matches are rejected. Queries shorter than 4 characters are rejected.
+   */
   findOpenByTokenQuery(query: string, includeDryRun: boolean): OpenPosition[] {
     const q = query.trim().toLowerCase();
-    if (!q) return [];
-    return this.listOpen({ includeDryRun }).filter((p) => {
-      const sym = (p.tokenSymbol ?? "").toLowerCase();
-      const addr = p.tokenAddress.toLowerCase();
-      return sym === q || addr === q || sym.includes(q) || addr.includes(q);
-    });
+    if (q.length < 4) return [];
+    const open = this.listOpen({ includeDryRun });
+    const byMint = open.filter((p) => p.tokenAddress.toLowerCase() === q);
+    if (byMint.length) return byMint;
+    const bySymbol = open.filter((p) => (p.tokenSymbol ?? "").toLowerCase() === q);
+    if (bySymbol.length === 1) return bySymbol;
+    return [];
   }
 
   tokenExposureUsd(tokenAddress: string, chain: string, liveOnly: boolean): number {
@@ -382,7 +394,8 @@ export class Store {
     if (opts.fullyClosed) {
       this.db
         .prepare(
-          `UPDATE positions SET status=?, closed_at=?, exit_usd=?, exit_reason=?, realized_pnl_usd=?,
+          `UPDATE positions SET status=?, closed_at=?, exit_usd=?, exit_reason=?,
+           realized_pnl_usd = coalesce(realized_pnl_usd,0) + ?,
            tx_exit=?, quantity_raw=?, remaining_usd=0 WHERE id=?`,
         )
         .run(
@@ -436,12 +449,13 @@ export class Store {
     const row = this.db
       .prepare("SELECT * FROM daily_stats WHERE date = ?")
       .get(date) as Record<string, unknown> | undefined;
-    if (!row) return { date, spentUsd: 0, realizedPnlUsd: 0, paperRealizedPnlUsd: 0, trades: 0 };
+    if (!row) return { date, spentUsd: 0, realizedPnlUsd: 0, paperRealizedPnlUsd: 0, paperSpentUsd: 0, trades: 0 };
     return {
       date,
       spentUsd: Number(row.spent_usd),
       realizedPnlUsd: Number(row.realized_pnl_usd),
       paperRealizedPnlUsd: Number(row.paper_realized_pnl_usd ?? 0),
+      paperSpentUsd: Number(row.paper_spent_usd ?? 0),
       trades: Number(row.trades),
     };
   }
@@ -465,6 +479,16 @@ export class Store {
       .run(date, usd);
   }
 
+  addPaperSpend(usd: number, date = todayUtc()): void {
+    this.db
+      .prepare(
+        `INSERT INTO daily_stats (date, spent_usd, realized_pnl_usd, paper_spent_usd, trades)
+         VALUES (?, 0, 0, ?, 0)
+         ON CONFLICT(date) DO UPDATE SET paper_spent_usd = paper_spent_usd + excluded.paper_spent_usd`,
+      )
+      .run(date, usd);
+  }
+
   /** DRY_RUN paper PnL. Kept off realized_pnl_usd so it cannot trip the live loss limit. */
   addPaperRealizedPnl(usd: number, date = todayUtc()): void {
     this.db
@@ -481,6 +505,33 @@ export class Store {
       | { value: string }
       | undefined;
     return row?.value ?? null;
+  }
+
+  bumpFlatConfirm(trader: string, mint: string): number {
+    const key = `flat_confirm:${trader.toLowerCase()}:${mint.toLowerCase()}`;
+    const next = Number(this.getMeta(key) ?? "0") + 1;
+    this.setMeta(key, String(next));
+    return next;
+  }
+
+  clearFlatConfirm(trader: string, mint: string): void {
+    const key = `flat_confirm:${trader.toLowerCase()}:${mint.toLowerCase()}`;
+    this.db.prepare(`DELETE FROM meta WHERE key = ?`).run(key);
+  }
+
+  claimFillDedupe(key: string): boolean {
+    const result = this.db
+      .prepare(`INSERT OR IGNORE INTO fill_dedupe (dedupe_key, created_at) VALUES (?, ?)`)
+      .run(key, new Date().toISOString()) as { changes?: number };
+    return (result.changes ?? 0) > 0;
+  }
+
+  noteAlertTs(tsMs: number): void {
+    const prev = this.getMeta("alerts_since");
+    const prevMs = prev ? Date.parse(prev) : 0;
+    if (!Number.isFinite(prevMs) || tsMs > prevMs) {
+      this.setMeta("alerts_since", new Date(tsMs).toISOString());
+    }
   }
 
   setMeta(key: string, value: string): void {
@@ -519,6 +570,16 @@ export class Store {
   setTraderTokenAmount(id: string, amount: number): void {
     this.db
       .prepare(`UPDATE positions SET trader_token_amount_at_entry = ? WHERE id = ?`)
+      .run(amount, id);
+  }
+
+  /** Entry snapshot must not overwrite a newer post-sell baseline. */
+  setTraderTokenAmountIfEmpty(id: string, amount: number): void {
+    this.db
+      .prepare(
+        `UPDATE positions SET trader_token_amount_at_entry = ?
+         WHERE id = ? AND trader_token_amount_at_entry IS NULL`,
+      )
       .run(amount, id);
   }
 
@@ -692,9 +753,14 @@ export class Store {
   traderRealizedStats(
     userId: string,
     handle: string | null,
-    opts: { includeDryRun?: boolean } = {},
+    opts: { includeDryRun?: boolean; book?: "live" | "paper" } = {},
   ): { closes: number; wins: number; realizedPnlUsd: number } {
-    const statuses = opts.includeDryRun ? "('closed','dry_closed')" : "('closed')";
+    const statuses =
+      opts.book === "paper"
+        ? "('dry_closed')"
+        : opts.book === "live" || !opts.includeDryRun
+          ? "('closed')"
+          : "('closed','dry_closed')";
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS closes,
@@ -713,7 +779,7 @@ export class Store {
   }
 
   listTraderStats(includeDryRun: boolean): TraderStats[] {
-    const statuses = includeDryRun ? "('closed','dry_closed')" : "('closed')";
+    const statuses = includeDryRun ? "('dry_closed')" : "('closed')";
     const rows = this.db
       .prepare(
         `SELECT trader_user_id AS traderUserId,
@@ -991,7 +1057,7 @@ function todayUtc(): string {
 function rowToPosition(row: Record<string, unknown>): OpenPosition {
   const sizeUsd = Number(row.size_usd);
   const remaining =
-    row.remaining_usd != null && Number(row.remaining_usd) > 0
+    row.remaining_usd != null && Number.isFinite(Number(row.remaining_usd))
       ? Number(row.remaining_usd)
       : sizeUsd;
   return {

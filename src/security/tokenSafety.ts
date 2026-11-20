@@ -47,6 +47,7 @@ export async function inspectSolanaMint(
     blockTransferHooks?: boolean;
     /** Active mint authority. Default true (fail closed on a live mint). */
     blockMintAuthority?: boolean;
+    maxTransferFeeBps?: number;
     /** Transfer-fee mints: block | warn (default warn). */
     transferFeePolicy?: "block" | "warn" | "off";
     fetchImpl?: typeof fetch;
@@ -99,6 +100,14 @@ export async function inspectSolanaMint(
     }
     if (owner === TOKEN_PROGRAM) finding.program = "spl-token";
     else if (owner === TOKEN_2022_PROGRAM) finding.program = "token-2022";
+    else {
+      finding.warnings.push(`mint owner is not Token or Token-2022: ${owner ?? "missing"}`);
+      if (mode === "block") {
+        finding.blocked = true;
+        finding.blockReason = "unknown_program";
+      }
+      return finding;
+    }
 
     const data = parsedData;
     if (data && typeof data === "object" && data !== null && "parsed" in data) {
@@ -113,7 +122,24 @@ export async function inspectSolanaMint(
           };
         };
       };
+      const parsedType = parsed.parsed?.type;
+      if (parsedType !== "mint") {
+        finding.warnings.push(`account is not a mint (type=${parsedType ?? "missing"})`);
+        if (mode === "block") {
+          finding.blocked = true;
+          finding.blockReason = "not_a_mint";
+        }
+        return finding;
+      }
       const info = parsed.parsed?.info;
+      if (!info) {
+        finding.warnings.push("mint account did not parse");
+        if (mode === "block") {
+          finding.blocked = true;
+          finding.blockReason = "not_a_mint";
+        }
+        return finding;
+      }
       if (info) {
         finding.freezeAuthority = info.freezeAuthority ?? null;
         finding.mintAuthority = info.mintAuthority ?? null;
@@ -126,6 +152,49 @@ export async function inspectSolanaMint(
           }
           if (name === "transferfeeconfig" || name === "transfer_fee_config") {
             finding.hasTransferFee = true;
+            const state = e.state as {
+              newerTransferFee?: { transferFeeBasisPoints?: number };
+              olderTransferFee?: { transferFeeBasisPoints?: number };
+            } | undefined;
+            const bps = Math.max(
+              state?.newerTransferFee?.transferFeeBasisPoints ?? 0,
+              state?.olderTransferFee?.transferFeeBasisPoints ?? 0,
+            );
+            const maxFee = opts.maxTransferFeeBps ?? 100;
+            if (bps > maxFee) {
+              finding.warnings.push(`transfer fee ${bps}bps > max ${maxFee}`);
+              if (mode === "block") {
+                finding.blocked = true;
+                finding.blockReason = finding.blockReason ?? "transfer_fee";
+              }
+            }
+          }
+          if (name === "permanentdelegate" || name === "permanent_delegate") {
+            finding.warnings.push("Token-2022 permanent delegate");
+            if (mode === "block") {
+              finding.blocked = true;
+              finding.blockReason = finding.blockReason ?? "permanent_delegate";
+            }
+          }
+          if (name === "nontransferable" || name === "non_transferable") {
+            finding.warnings.push("Token-2022 non-transferable");
+            if (mode === "block") {
+              finding.blocked = true;
+              finding.blockReason = finding.blockReason ?? "non_transferable";
+            }
+          }
+          if (name === "defaultaccountstate" || name === "default_account_state") {
+            const state = e.state as { state?: string } | string | undefined;
+            const frozen =
+              state === "frozen" ||
+              (typeof state === "object" && state?.state?.toLowerCase() === "frozen");
+            if (frozen) {
+              finding.warnings.push("Token-2022 default account state is frozen");
+              if (mode === "block") {
+                finding.blocked = true;
+                finding.blockReason = finding.blockReason ?? "default_frozen";
+              }
+            }
           }
         }
       }
@@ -198,7 +267,7 @@ export function evaluateTopHolder(opts: {
   }
   const bps = holderConcentrationBps(opts.topAmount, opts.supply);
   if (bps == null) return { blocked: true, detail: "top holder supply unusable (fail closed)" };
-  if (bps > opts.maxTopHolderBps) {
+  if (bps >= opts.maxTopHolderBps) {
     return {
       blocked: true,
       detail: `top holder ${bps}bps > maxTopHolderBps ${opts.maxTopHolderBps}`,
@@ -268,11 +337,21 @@ export function liquidityUsdFromDexScreener(body: unknown): number | null {
   if (!body || typeof body !== "object") return null;
   const pairs = (body as { pairs?: unknown }).pairs;
   if (!Array.isArray(pairs)) return null;
-  let best = 0;
-  let saw = false;
-  for (const pair of pairs) {
-    if (!pair || typeof pair !== "object") continue;
-    const usd = (pair as { liquidity?: { usd?: unknown } }).liquidity?.usd;
+    const SOL = "So11111111111111111111111111111111111111112";
+    const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+    let best = 0;
+    let saw = false;
+    for (const pair of pairs) {
+      if (!pair || typeof pair !== "object") continue;
+      const row = pair as {
+        chainId?: string;
+        quoteToken?: { address?: string };
+        liquidity?: { usd?: unknown };
+      };
+      if ((row.chainId ?? "").toLowerCase() !== "solana") continue;
+      const quote = row.quoteToken?.address ?? "";
+      if (quote !== SOL && quote !== USDC) continue;
+      const usd = row.liquidity?.usd;
     if (typeof usd === "number" && Number.isFinite(usd)) {
       saw = true;
       if (usd > best) best = usd;

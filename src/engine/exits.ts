@@ -47,8 +47,8 @@ export function decideExit(opts: {
     if (markUsd > pos.peakMarkUsd) {
       return { type: "seed_peak", markUsd };
     }
-    const dropPct = ((pos.peakMarkUsd - markUsd) / pos.peakMarkUsd) * 100;
-    if (dropPct >= trail) {
+    const dropBps = Math.round(((pos.peakMarkUsd - markUsd) / pos.peakMarkUsd) * 10_000);
+    if (dropBps >= Math.round(trail * 100)) {
       return { type: "close", reason: "trailing_stop", fraction: 1 };
     }
   }

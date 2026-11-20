@@ -628,13 +628,13 @@ describe("rebuys, per-token cap, and sell-all", () => {
     cfg.sizing.mergeRebuys = true;
     cfg.sizing.maxUsdPerToken = 5;
     cfg.filters.firstBuysOnly = false;
-    await engine.handleAlert(alert({ eventId: "m1" }));
-    await engine.handleAlert(alert({ eventId: "m2" }));
+    await engine.handleAlert(alert({ eventId: "m1", tradeId: "m1" }));
+    await engine.handleAlert(alert({ eventId: "m2", tradeId: "m2" }));
     const open = store.listOpen({ includeDryRun: true });
     assert.equal(open.length, 1);
     assert.equal(open[0]!.quantityRaw, "2000000");
     assert.equal(open[0]!.remainingUsd, 4);
-    await engine.handleAlert(alert({ eventId: "m3" }));
+    await engine.handleAlert(alert({ eventId: "m3", tradeId: "m3" }));
     assert.equal(store.listOpen({ includeDryRun: true }).length, 1);
     assert.equal(store.listSkips(5).some((s) => s.reason === "token_cap"), true);
     assert.equal(fake.buys, 2);
@@ -646,8 +646,8 @@ describe("rebuys, per-token cap, and sell-all", () => {
     const { engine, store, cfg } = await setup(path.join(tmp, "sellall"), true, fake);
     cfg.sizing.mergeRebuys = false;
     cfg.sizing.maxUsdPerToken = 10;
-    await engine.handleAlert(alert({ eventId: "a1" }));
-    await engine.handleAlert(alert({ eventId: "a2" }));
+    await engine.handleAlert(alert({ eventId: "a1", tradeId: "a1" }));
+    await engine.handleAlert(alert({ eventId: "a2", tradeId: "a2" }));
     assert.equal(store.listOpen({ includeDryRun: true }).length, 2);
     await engine.handleAlert(alert({ eventId: "sell-all", alertType: "sell", tradeUsd: 5000 }));
     assert.equal(store.listOpen({ includeDryRun: true }).length, 0);
@@ -799,7 +799,7 @@ describe("token safety fails closed", () => {
       blockMintAuthority: true,
       getParsedAccountInfo: async () => ({
         owner: TOKEN_PROGRAM,
-        parsed: { parsed: { info: { mintAuthority: "StillMinting", freezeAuthority: null, supply: "10000" } } },
+        parsed: { parsed: { type: "mint", info: { mintAuthority: "StillMinting", freezeAuthority: null, supply: "10000" } } },
       }),
     });
     assert.equal(blocked.blocked, true);
@@ -809,7 +809,7 @@ describe("token safety fails closed", () => {
       blockMintAuthority: true,
       getParsedAccountInfo: async () => ({
         owner: TOKEN_PROGRAM,
-        parsed: { parsed: { info: { mintAuthority: null, freezeAuthority: null, supply: "10000" } } },
+        parsed: { parsed: { type: "mint", info: { mintAuthority: null, freezeAuthority: null, supply: "10000" } } },
       }),
     });
     assert.equal(ok.blocked, false);
@@ -865,7 +865,19 @@ describe("token safety fails closed", () => {
       evaluateLiquidity({ minLiquidityUsd: 1000, liquidityUsd: 5000, fetchFailed: false }).blocked,
       false,
     );
-    assert.equal(liquidityUsdFromDexScreener({ pairs: [{ liquidity: { usd: 10 } }, { liquidity: { usd: 40 } }] }), 40);
+    assert.equal(
+      liquidityUsdFromDexScreener({
+        pairs: [
+          { chainId: "ethereum", quoteToken: { address: "0xabc" }, liquidity: { usd: 999999 } },
+          {
+            chainId: "solana",
+            quoteToken: { address: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v" },
+            liquidity: { usd: 12000 },
+          },
+        ],
+      }),
+      12000,
+    );
     const limited = await fetchLargestHolderAmount(
       "http://rpc.example",
       MINT_A,
@@ -1028,11 +1040,19 @@ describe("reconcile, pnl, daily loss, rest polling, close-account ix", () => {
     assert.equal(unknown.flat, 0);
     assert.equal(store.listOpen({ includeDryRun: true }).length, 1);
     assert.equal(traderHoldState({ available: false }, MINT_A), "unknown");
-    assert.equal(traderHoldState({ positions: [] }, MINT_A), "flat");
+    assert.equal(traderHoldState({ positions: [] }, MINT_A), "unknown");
+    assert.equal(
+      traderHoldState({ positions: [{ token: { address: "other" }, status: "open", amount: 1 }] }, MINT_A),
+      "absent",
+    );
     const flat = await reconcileOpenPositions({
       store,
       includeDryRun: true,
-      fomo: { positions: async () => ({ positions: [] }) } as never,
+      fomo: {
+        positions: async () => ({
+          positions: [{ token: { address: MINT_A }, status: "closed", amount: 0 }],
+        }),
+      } as never,
       onFlat: async (p) => {
         await engine.closePosition(p, "reconcile_flat");
       },

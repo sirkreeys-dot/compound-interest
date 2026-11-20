@@ -134,7 +134,7 @@ describe("safety: money helpers", () => {
   });
   it("sellFraction proportional and full fallback", () => {
     assert.equal(sellFraction({ traderSellUsd: 250, traderSizeAtEntryUsd: 1000 }), 0.25);
-    assert.equal(sellFraction({ traderSellUsd: null, traderSizeAtEntryUsd: 1000 }), 1);
+    assert.equal(sellFraction({ traderSellUsd: null, traderSizeAtEntryUsd: 1000 }), 0.5);
     assert.equal(scaleRawAmount("1000", 0.25), "250");
   });
 });

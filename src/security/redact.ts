@@ -10,6 +10,7 @@ export function redactSecrets(input: string): string {
       .replace(/([?&](?:key|api_key|apikey|access_token)=)[^&\s"'`]+/gi, "$1[REDACTED]")
       // Authorization bearer
       .replace(/(Bearer\s+)[A-Za-z0-9._\-+=/]+/gi, "$1[REDACTED]")
+      .replace(/\bfapi_[A-Za-z0-9_-]+/g, "fapi_[REDACTED]")
       // Telegram bot tokens in URLs: bot<id>:<secret>
       .replace(/\bbot\d+:[A-Za-z0-9_-]+/g, "bot[REDACTED]")
       // Jupiter / 0x header echo (defensive)

@@ -119,7 +119,7 @@ export async function runTpSlPass(opts: {
 }
 
 function noteQuoteFailure(
-  opts: { cfg: AppConfig; store: Store },
+  opts: { cfg: AppConfig; store: Store; tg?: TelegramNotifier },
   pos: OpenPosition,
   detail: string,
 ): void {
@@ -131,7 +131,10 @@ function noteQuoteFailure(
   if (shouldWriteOffQuoteFailures(n, limit)) {
     opts.store.markWrittenOff(pos.id, `quote_failures:${n}`);
     log.warn(
-      `Wrote off ${pos.tokenSymbol ?? pos.tokenAddress} after ${n} failed quotes — no longer counts toward maxOpenPositions`,
+      `Wrote off ${pos.tokenSymbol ?? pos.tokenAddress} after ${n} failed price fetches — no longer counts toward maxOpenPositions`,
+    );
+    void opts.tg?.send(
+      `<b>Position written off</b>\n${pos.tokenSymbol ?? "?"} <code>${pos.tokenAddress}</code>\n${n} price fetches failed. Tokens may still be in the wallet. It no longer counts toward maxOpenPositions.`,
     );
   }
 }

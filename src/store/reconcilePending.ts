@@ -21,6 +21,8 @@ export async function reconcilePendingSwaps(opts: {
   getSignatureStatuses?: (
     sigs: string[],
   ) => Promise<Array<{ confirmationStatus?: string | null; err?: unknown } | null>>;
+  /** On-chain token balance. Quote amounts are not used when this is absent. */
+  getWalletTokenAmount?: (mint: string) => Promise<string | null>;
 }): Promise<{ resolved: number; unresolved: number }> {
   const rows = opts.store.listUnresolvedPending();
   if (!rows.length) return { resolved: 0, unresolved: 0 };
@@ -65,6 +67,7 @@ async function reconcileOne(
     getSignatureStatuses?: (
       sigs: string[],
     ) => Promise<Array<{ confirmationStatus?: string | null; err?: unknown } | null>>;
+    getWalletTokenAmount?: (mint: string) => Promise<string | null>;
   },
 ): Promise<"resolved" | "unresolved"> {
   // Already failed cleanly — leave as failed (not in unresolved list normally)
@@ -72,16 +75,20 @@ async function reconcileOne(
     return "resolved";
   }
 
-  // pending_broadcast with no signature: never sent — mark failed
-  if (row.status === "pending_broadcast" && !row.txSignature) {
+  // No signature on disk: do not call this safe. Jupiter may already have the tx.
+  if (!row.txSignature) {
+    const note = row.notes?.includes("requestId=")
+      ? row.notes
+      : "no signature or request id on disk";
     opts.store.updatePendingSwap(row.id, {
-      status: "failed",
-      error: "startup: never broadcast",
+      status: "unresolved",
+      error: "startup: not proven safe — no signature to check",
+      notes: note,
     });
     await opts.tg.send(
-      `<b>Pending buy abandoned</b>\nid=<code>${row.id}</code> never reached broadcast (safe).`,
+      `<b>⚠️ Pending ${row.side} not proven safe</b>\nid=<code>${row.id}</code>\nNo signature was stored before broadcast. Check the wallet before trading again.`,
     );
-    return "resolved";
+    return "unresolved";
   }
 
   // Have a signature — check RPC status
@@ -126,7 +133,19 @@ async function reconcileOne(
         opts.store.markPendingReconciled(row.id, open.id);
         return "resolved";
       }
-      // Insert a recovery position using expected/known amounts
+      const walletAmt = opts.getWalletTokenAmount
+        ? await opts.getWalletTokenAmount(row.tokenAddress)
+        : null;
+      if (!walletAmt) {
+        opts.store.updatePendingSwap(row.id, {
+          status: "unresolved",
+          error: "confirmed signature but wallet balance was not read — quote amount was not trusted",
+        });
+        await opts.tg.send(
+          `<b>⚠️ Confirmed buy needs a wallet balance</b>\nid=<code>${row.id}</code>\ntx=<code>${row.txSignature}</code>`,
+        );
+        return "unresolved";
+      }
       const posId = randomUUID();
       try {
         opts.store.insertPosition({
@@ -140,7 +159,7 @@ async function reconcileOne(
           entryUsd: row.sizeUsd ?? 0,
           sizeUsd: row.sizeUsd ?? 0,
           remainingUsd: row.sizeUsd ?? 0,
-          quantityRaw: row.expectedOutRaw ?? "0",
+          quantityRaw: walletAmt,
           entryPriceUsd: null,
           traderSizeAtEntryUsd: null,
           traderTokenAmountAtEntry: null,

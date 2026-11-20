@@ -28,6 +28,8 @@ export type SellFractionMethod =
   | "fomo_fully_closed"
   | "alert_trade_usd"
   | "alert_trade_vs_remaining"
+  | "fomo_no_change"
+  | "fomo_absent"
   | "unknown";
 
 export interface SellFractionResult {
@@ -64,8 +66,8 @@ export function mapTraderSellToOurFraction(traderFraction: number | null): {
       detail: `trader sold ${(f * 100).toFixed(2)}% of their position (< 10%) — ignored`,
     };
   }
-  // 99.9%+ counts as a full exit so a closed position is not left as a partial.
-  if (f >= 0.999) {
+  // Only a true 100% (float noise within 1e-9) is a full exit. 99.9% stays a partial.
+  if (f >= 1 - 1e-9) {
     return {
       action: "sell",
       ourFraction: 1,
@@ -138,33 +140,45 @@ export async function resolveSellFraction(opts: {
           row.amount >= 0
         ) {
           const sold = Math.max(0, entryAmt - row.amount);
-          const frac = Math.min(1, sold / entryAmt);
-          if (frac > 0) {
+          if (sold <= 0) {
             return {
-              fraction: frac,
-              method: "fomo_position_delta",
-              detail: `previous=${entryAmt} now=${row.amount} sold=${sold} (${(frac * 100).toFixed(2)}% of last observed position)`,
+              fraction: 0,
+              method: "fomo_no_change",
+              detail: `token amount did not fall (previous=${entryAmt} now=${row.amount}) — ignore this sell`,
               nextTraderTokenAmount: row.amount,
             };
           }
-        }
-
-        // Do NOT use cumulative soldAmount/boughtAmount. Those are lifetime totals.
-      } else if (body.available !== false) {
-        const openOnly = rows.filter((r) => r.status === "open" || r.status == null);
-        const still = openOnly.find(
-          (r) =>
-            r.token?.address &&
-            r.token.address.toLowerCase() === pos.tokenAddress.toLowerCase(),
-        );
-        if (!still) {
+          const frac = Math.min(1, sold / entryAmt);
           return {
-            fraction: 1,
-            method: "fomo_fully_closed",
-            detail: "token not in FOMO open positions",
-            nextTraderTokenAmount: 0,
+            fraction: frac,
+            method: "fomo_position_delta",
+            detail: `previous=${entryAmt} now=${row.amount} sold=${sold} (${(frac * 100).toFixed(2)}% of last observed position)`,
+            nextTraderTokenAmount: row.amount,
           };
         }
+
+        // Open row but no baseline: do not treat USD as proof they sold. Unknown.
+        return {
+          fraction: null,
+          method: "unknown",
+          detail: "FOMO row is open but we have no token baseline to measure this sell",
+          nextTraderTokenAmount: seenAmount,
+        };
+      } else if (body.available !== false) {
+        if (rows.length === 0) {
+          return {
+            fraction: null,
+            method: "unknown",
+            detail: "FOMO positions array is empty — not treated as flat",
+            nextTraderTokenAmount: null,
+          };
+        }
+        return {
+          fraction: null,
+          method: "fomo_absent",
+          detail: "token missing from a non-empty FOMO book — needs a second consistent read before a full exit",
+          nextTraderTokenAmount: null,
+        };
       }
     } catch (e) {
       log.warn("FOMO positions lookup for sell fraction failed", e);
@@ -212,13 +226,13 @@ export async function resolveSellFraction(opts: {
 /**
  * Whether the trader still holds `tokenAddress` according to a FOMO positions body.
  * `unknown` means the payload could not be trusted — callers must not flatten on it.
- * A token missing from a parsed positions array is `flat` (the same assumption the
- * sell-fraction path already uses).
+ * An empty list is unknown. A mint missing from a non-empty list is `absent`
+ * (one observation, not yet a full exit). `flat` is only an explicit closed or zero row.
  */
 export function traderHoldState(
   body: unknown,
   tokenAddress: string,
-): "open" | "flat" | "unknown" {
+): "open" | "flat" | "absent" | "unknown" {
   if (!body || typeof body !== "object") return "unknown";
   const b = body as { available?: boolean; positions?: PosRow[]; trades?: PosRow[] };
   if (b.available === false) return "unknown";
@@ -227,10 +241,10 @@ export function traderHoldState(
     : Array.isArray(b.trades)
       ? b.trades
       : null;
-  if (!rows) return "unknown";
+  if (!rows || rows.length === 0) return "unknown";
   const addr = tokenAddress.toLowerCase();
   const row = rows.find((r) => r.token?.address && r.token.address.toLowerCase() === addr);
-  if (!row) return "flat";
+  if (!row) return "absent";
   if (row.status === "closed") return "flat";
   if (typeof row.amount === "number" && row.amount <= 0) return "flat";
   return "open";

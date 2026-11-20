@@ -3,6 +3,7 @@ import path from "node:path";
 import dotenv from "dotenv";
 import yaml from "js-yaml";
 import { z } from "zod";
+import { DEFAULT_SOLANA_PROGRAM_ALLOWLIST } from "./security/programAllowlist.js";
 import type { AppConfig, LeaderboardWindow, TraderSource } from "./types.js";
 
 dotenv.config();
@@ -75,6 +76,8 @@ const configSchema = z.object({
     maxTopHolderBps: z.number().int().nonnegative().default(9000),
     roundTripMaxLossBps: z.number().int().nonnegative().default(2500),
     minLiquidityUsd: z.number().nonnegative().default(10_000),
+    /** Token-2022 transfer fee above this bps fails closed. */
+    maxTransferFeeBps: z.number().int().nonnegative().default(100),
   }),
   risk: z.object({
     trailingStopPct: z.number().nonnegative().default(20),
@@ -96,6 +99,12 @@ const configSchema = z.object({
     closeEmptyTokenAccount: z.boolean().default(true),
     quoteFailWriteoffCount: z.number().int().positive().default(5),
     mirroredSellMaxRetries: z.number().int().positive().default(4),
+    /** Jupiter inUsdValue may exceed maxUsdPerTrade by this many bps (fees). */
+    inUsdToleranceBps: z.number().int().nonnegative().default(200),
+    /** Two SOL/USD sources may differ by at most this many bps. */
+    solPriceDivergenceBps: z.number().int().nonnegative().default(250),
+    /** Top-level programs a signed Jupiter tx may call. */
+    solanaProgramAllowlist: z.array(z.string().min(32)).default(DEFAULT_SOLANA_PROGRAM_ALLOWLIST),
   }),
   quote: z.object({
     solanaNative: z.string(),

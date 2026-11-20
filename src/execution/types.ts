@@ -19,6 +19,8 @@ export interface SwapRequest {
   traderUserId?: string | null;
   traderHandle?: string | null;
   tokenSymbol?: string | null;
+  /** Called immediately before tx.sign. Throw to refuse the signature. */
+  beforeSign?: () => void | Promise<void>;
 }
 
 export interface SwapResult {
@@ -46,6 +48,8 @@ export interface SwapResult {
   solInLamports?: string;
   /** Lamports of SOL actually received (native-SOL output only). */
   solOutLamports?: string;
+  /** Previous signature is not confirmed failed. Do not sign another transaction. */
+  inFlight?: boolean;
 }
 
 export interface Executor {

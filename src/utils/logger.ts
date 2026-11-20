@@ -14,10 +14,25 @@ function safeExtra(extra: unknown): unknown {
   if (extra === undefined) return undefined;
   if (typeof extra === "string") return redactSecrets(extra);
   if (extra instanceof Error) {
-    return redactSecrets(`${extra.name}: ${extra.message}`);
+    const cause = (extra as Error & { cause?: unknown }).cause;
+    const causeText =
+      cause instanceof Error
+        ? ` cause=${cause.name}: ${cause.message}`
+        : cause != null
+          ? ` cause=${typeof cause === "string" ? cause : safeJson(cause)}`
+          : "";
+    return redactSecrets(`${extra.name}: ${extra.message}${causeText}`);
   }
   try {
     return redactSecrets(typeof extra === "object" ? JSON.stringify(extra) : String(extra));
+  } catch {
+    return "[unserializable]";
+  }
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value);
   } catch {
     return "[unserializable]";
   }

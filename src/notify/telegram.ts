@@ -35,12 +35,20 @@ export class TelegramNotifier {
   private pollTimer: NodeJS.Timeout | null = null;
   private deps: Omit<TelegramDeps, "token" | "chatId"> | null = null;
   readonly enabled: boolean;
+  /** Commands require TELEGRAM_ALLOWED_USER_IDS. Empty allowlist disables them. */
+  readonly commandsEnabled: boolean;
 
   constructor(token: string, chatId: string, allowedUserIds: string[] = []) {
     this.token = token;
     this.chatId = chatId;
     this.allowedUserIds = new Set(allowedUserIds.map((s) => String(s).trim()).filter(Boolean));
     this.enabled = Boolean(token && chatId);
+    this.commandsEnabled = this.enabled && this.allowedUserIds.size > 0;
+    if (this.enabled && !this.commandsEnabled) {
+      log.warn(
+        "Telegram commands disabled — set TELEGRAM_ALLOWED_USER_IDS. Chat id alone is not enough for /close, /writeoff, /pause, or /resume.",
+      );
+    }
     if (!this.enabled) {
       log.warn(
         "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID for notifications and commands",
@@ -54,7 +62,7 @@ export class TelegramNotifier {
   }
 
   startCommandPolling(): void {
-    if (!this.enabled) return;
+    if (!this.commandsEnabled) return;
     const tick = async () => {
       try {
         await this.pollUpdates();
@@ -238,11 +246,16 @@ export class TelegramNotifier {
         };
       }>;
     };
+    if (!this.commandsEnabled) return;
     if (!data.ok || !data.result) return;
     const expected = String(this.chatId).trim();
     for (const u of data.result) {
       this.offset = u.update_id + 1;
-      const msg = u.message ?? u.edited_message;
+      if (u.edited_message && !u.message) {
+        log.warn("Ignored Telegram command from edited_message");
+        continue;
+      }
+      const msg = u.message;
       const chatId = msg?.chat?.id;
       const fromId = msg?.from?.id;
       const text = msg?.text?.trim() ?? "";
@@ -257,16 +270,9 @@ export class TelegramNotifier {
         log.warn(`Ignored Telegram command from unauthorized chat`);
         continue;
       }
-      // Optional sender lock (group-safe): when TELEGRAM_ALLOWED_USER_IDS is set
-      if (this.allowedUserIds.size > 0) {
-        if (fromId === undefined || fromId === null) {
-          log.warn("Ignored Telegram command with missing from.id (allowed-user lock)");
-          continue;
-        }
-        if (!this.allowedUserIds.has(String(fromId).trim())) {
-          log.warn(`Ignored Telegram command from unauthorized user id`);
-          continue;
-        }
+      if (fromId === undefined || fromId === null || !this.allowedUserIds.has(String(fromId).trim())) {
+        log.warn("Ignored Telegram command from unauthorized user id");
+        continue;
       }
       const parts = text.split(/\s+/);
       const cmd = parts[0]!.split("@")[0]!;

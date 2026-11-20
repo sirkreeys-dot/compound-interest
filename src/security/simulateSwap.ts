@@ -294,6 +294,8 @@ export interface SimulateSwapOpts {
   maxFeeLamports?: number;
   reportedFeeLamports?: number | null;
   maxExtraTokenOutflow?: bigint;
+  /** Fully resolved account keys, including address-lookup-table accounts. */
+  extraAccountKeys?: import("@solana/web3.js").PublicKey[];
   /** Injected for tests */
   connection?: Connection;
   simulateImpl?: (
@@ -383,7 +385,10 @@ export async function simulateAndValidateSwap(
     candidateAtas.push(outputAta);
   }
 
-  // Include other static account keys (no ALT resolution for lookups — static keys only)
+  for (const extra of opts.extraAccountKeys ?? []) {
+    watched.push(extra);
+  }
+  // Static keys. Lookup-table accounts arrive via extraAccountKeys.
   for (let i = 0; i < keys.length; i++) {
     const k = keys.get(i);
     if (!k) continue;

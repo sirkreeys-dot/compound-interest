@@ -100,6 +100,10 @@ async function main(): Promise<void> {
   );
   if ((cfg.filters.maxTopHolderBps ?? 0) > 0 && isPublicSolanaRpc(env.solanaRpcUrl)) {
     log.warn(PUBLIC_RPC_HOLDER_WARNING);
+    if (!env.dryRun) {
+      log.error("Refusing live trading on the public Solana RPC while the top-holder check is on.");
+      process.exit(1);
+    }
   }
 
   if (!env.fomoApiKey) {
@@ -291,6 +295,7 @@ async function main(): Promise<void> {
   });
   process.on("uncaughtException", (err) => {
     log.error(`Uncaught exception: ${err.message}`);
+    process.exit(1);
   });
 
   log.info(`Config: ${path.resolve(env.configPath)}`);

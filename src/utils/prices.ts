@@ -33,6 +33,8 @@ export interface PriceServiceOpts {
   maxAgeMs?: number;
   /** Max age for CoinGecko fallback (ms). Default 15s — tighter. */
   coingeckoMaxAgeMs?: number;
+  /** Max Jupiter-vs-CoinGecko divergence in bps. Default 250. */
+  divergenceBps?: number;
   now?: () => number;
   fetchImpl?: typeof fetch;
 }
@@ -45,45 +47,50 @@ export class PriceService {
   private readonly fetchImpl: typeof fetch;
   private readonly jupiterApiKey: string;
   private readonly zeroXApiKey: string;
+  private readonly divergenceBps: number;
 
   constructor(opts: PriceServiceOpts = {}) {
     this.maxAgeMs = opts.maxAgeMs ?? 30_000;
     this.cgMaxAgeMs = opts.coingeckoMaxAgeMs ?? 15_000;
+    this.divergenceBps = opts.divergenceBps ?? 250;
     this.now = opts.now ?? (() => Date.now());
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.jupiterApiKey = opts.jupiterApiKey ?? "";
     this.zeroXApiKey = opts.zeroXApiKey ?? "";
   }
 
-  /** SOL USD — Jupiter Price v3, then /order USDC→SOL cross-check, then guarded CoinGecko. */
+  /** SOL USD from Jupiter, accepted only when CoinGecko agrees within divergenceBps. */
   async getSolUsd(): Promise<FreshPrice> {
     const cached = this.getFreshCached("sol", this.maxAgeMs);
     if (cached && cached.source !== "coingecko_fallback") return cached;
 
+    let primary: FreshPrice | null = null;
     try {
       const p = await this.fetchJupiterPriceV3(SOL_MINT);
-      if (p && inBounds(p.usd, SOL_SANITY)) {
-        const fresh = { ...p, source: "jupiter_v3" as const };
-        this.cache.set("sol", fresh);
-        return fresh;
-      }
+      if (p && inBounds(p.usd, SOL_SANITY)) primary = { ...p, source: "jupiter_v3" };
     } catch (e) {
       log.debug("Jupiter price v3 SOL failed", e);
     }
-
-    try {
-      const p = await this.fetchSolViaJupiterOrder();
-      if (p && inBounds(p.usd, SOL_SANITY)) {
-        this.cache.set("sol", p);
-        return p;
+    if (!primary) {
+      try {
+        const p = await this.fetchSolViaJupiterOrder();
+        if (p && inBounds(p.usd, SOL_SANITY)) primary = p;
+      } catch (e) {
+        log.debug("Jupiter order SOL price failed", e);
       }
-    } catch (e) {
-      log.debug("Jupiter order SOL price failed", e);
     }
-
-    const cg = await this.fetchCoinGecko("solana", "sol", SOL_SANITY);
-    if (cg) return cg;
-    throw new Error("No fresh SOL/USD price (Jupiter + CoinGecko failed or out of bounds)");
+    const cg = await this.fetchCoinGecko("solana", "sol-cg", SOL_SANITY);
+    if (!primary || !cg) {
+      throw new Error("SOL price cross-check failed (need Jupiter and CoinGecko)");
+    }
+    const bps = (Math.abs(primary.usd - cg.usd) / primary.usd) * 10_000;
+    if (bps > this.divergenceBps) {
+      throw new Error(
+        `SOL price divergence ${Math.round(bps)}bps > ${this.divergenceBps}bps (jupiter=${primary.usd} coingecko=${cg.usd})`,
+      );
+    }
+    this.cache.set("sol", primary);
+    return primary;
   }
 
   /** ETH USD on Base — 0x price (1 ETH → USDC), then guarded CoinGecko. */

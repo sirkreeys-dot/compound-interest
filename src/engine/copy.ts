@@ -30,7 +30,7 @@ const CLAIM_ON_SKIP = new Set<SkipReason>([
   "chain_disabled_for_trader",
 ]);
 
-const MIRRORED_SELL = new Set(["trader_sell", "reconcile_flat"]);
+const MIRRORED_SELL = new Set(["trader_sell", "reconcile_flat", "stop_loss", "trailing_stop"]);
 
 interface EntryHold {
   traderKey: string;
@@ -55,6 +55,7 @@ export class CopyEngine {
   private reservedSpend = 0;
   private reservedSlots = 0;
   private readonly cooldownHold = new Map<string, number>();
+  private actualSpend: number | null = null;
 
   constructor(
     private readonly env: EnvConfig,
@@ -65,7 +66,9 @@ export class CopyEngine {
     private readonly tg: TelegramNotifier,
     private readonly watchlist: Watchlist,
     private readonly fomo: FomoRestClient | null = null,
-  ) {}
+  ) {
+    this.watchlist.usePaperBook(env.dryRun);
+  }
 
   async handleAlert(alert: NormalizedAlert, opts?: { suppressBuy?: boolean }): Promise<void> {
     const key = tokenLockKey(alert.chain, alert.tokenAddress ?? alert.eventId);
@@ -211,6 +214,16 @@ export class CopyEngine {
       log.info(`SKIP already_processed (lost claim race) ${alert.eventId}`);
       return;
     }
+    const dedupeKey = fillDedupeKey(alert);
+    if (dedupeKey && !this.store.claimFillDedupe(dedupeKey)) {
+      log.info(`SKIP duplicate fill ${dedupeKey}`);
+      this.noteSkip(alert, "already_processed", dedupeKey, { notify: false });
+      return;
+    }
+    if (alert.ts != null && Number.isFinite(alert.ts)) {
+      const ms = alert.ts < 1e12 ? alert.ts * 1000 : alert.ts;
+      this.store.noteAlertTs(ms);
+    }
 
     if (alert.alertType === "buy") {
       await this.copyBuy(alert, filtered.sizeUsd!);
@@ -229,6 +242,9 @@ export class CopyEngine {
     alert: NormalizedAlert,
     sizeUsd: number,
   ): { ok: true; hold: EntryHold } | { ok: false; reason: SkipReason; detail: string } {
+    if (this.kill.isPaused()) {
+      return { ok: false, reason: "paused", detail: "kill switch rechecked before submit" };
+    }
     const dry = this.env.dryRun;
     const liveOnly = !dry;
     const traderKey = alert.userId ?? alert.traderHandle ?? "";
@@ -267,11 +283,12 @@ export class CopyEngine {
     }
 
     const daily = this.store.getDaily();
-    if (!dry && daily.spentUsd + this.reservedSpend + sizeUsd > this.cfg.risk.dailyBudgetUsd) {
+    const spent = dry ? daily.paperSpentUsd : daily.spentUsd;
+    if (spent + this.reservedSpend + sizeUsd > this.cfg.risk.dailyBudgetUsd) {
       return {
         ok: false,
         reason: "daily_budget",
-        detail: `spent ${daily.spentUsd}+reserved ${this.reservedSpend}+${sizeUsd} > ${this.cfg.risk.dailyBudgetUsd}`,
+        detail: `spent ${spent}+reserved ${this.reservedSpend}+${sizeUsd} > ${this.cfg.risk.dailyBudgetUsd}`,
       };
     }
     const lossLimit = this.cfg.risk.dailyLossLimitUsd ?? 0;
@@ -288,11 +305,11 @@ export class CopyEngine {
 
     const now = Date.now();
     if (slot) this.reservedSlots += 1;
-    if (!dry) this.reservedSpend += sizeUsd;
+    this.reservedSpend += sizeUsd;
     this.cooldownHold.set(traderKey, now);
     return {
       ok: true,
-      hold: { traderKey, spend: dry ? 0 : sizeUsd, slot, cooldownTs: now },
+      hold: { traderKey, spend: sizeUsd, slot, cooldownTs: now },
     };
   }
 
@@ -303,7 +320,10 @@ export class CopyEngine {
       this.cooldownHold.delete(hold.traderKey);
     }
     if (!success) return;
-    if (!this.env.dryRun) this.store.addSpend(sizeUsd);
+    const spend = this.actualSpend ?? sizeUsd;
+    if (this.env.dryRun) this.store.addPaperSpend(spend);
+    else this.store.addSpend(spend);
+    this.actualSpend = null;
     this.store.setLastEntryAt(Date.now(), hold.traderKey);
   }
 
@@ -358,6 +378,9 @@ export class CopyEngine {
       traderUserId: alert.userId,
       traderHandle: alert.traderHandle,
       tokenSymbol: alert.tokenSymbol,
+      beforeSign: () => {
+        if (this.kill.isPaused()) throw new Error("paused");
+      },
     });
     pendingId = result.pendingId ?? pendingId;
 
@@ -417,6 +440,7 @@ Buy confirmed but outAmountRaw missing. pending=${pendingId} tx=${result.txHash 
         txEntry: result.txHash ?? null,
       });
       if (pendingId) this.store.markPendingReconciled(pendingId, existing.id);
+      this.actualSpend = result.inUsd ?? sizeUsd;
       this.scheduleSnapshot(existing.id, traderKey, alert.tokenAddress!);
       this.fire(
         this.tg.notifyEntry({
@@ -479,6 +503,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
     }
 
     if (pendingId) this.store.markPendingReconciled(pendingId, pos.id);
+    this.actualSpend = result.inUsd ?? sizeUsd;
     this.scheduleSnapshot(pos.id, traderKey, alert.tokenAddress!);
     this.fire(
       this.tg.notifyEntry({
@@ -499,7 +524,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
       .positions(traderKey)
       .then((body) => {
         const amt = findTraderTokenAmount(body, token);
-        if (amt != null) this.store.setTraderTokenAmount(posId, amt);
+        if (amt != null) this.store.setTraderTokenAmountIfEmpty(posId, amt);
       })
       .catch((e) => {
         log.debug("trader position snapshot failed", e);
@@ -561,6 +586,17 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
         fomo: this.fomo,
       });
       nextTraderTokenAmount = resolved.nextTraderTokenAmount;
+      if (resolved.method === "fomo_absent") {
+        const who = locked.traderUserId ?? locked.traderHandle ?? "";
+        const n = this.store.bumpFlatConfirm(who, locked.tokenAddress);
+        if (n < 2) {
+          this.store.revertClosingToOpen(pos.id);
+          log.info(`Trader flat read ${n}/2 for ${locked.tokenAddress} — not exiting yet`);
+          return;
+        }
+        resolved.fraction = 1;
+        resolved.method = "fomo_fully_closed";
+      }
       const mapped = mapTraderSellToOurFraction(resolved.fraction);
       fractionMethod = resolved.method;
       fractionDetail = `${resolved.detail}. ${mapped.detail}`;
@@ -635,6 +671,12 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
         dryRun,
       });
       if (result.ok) break;
+      if (result.inFlight) {
+        log.warn(
+          `Sell ${locked.tokenSymbol ?? locked.tokenAddress} signature still in flight — not signing the next slippage rung`,
+        );
+        return;
+      }
       log.warn(
         `Sell ${locked.tokenSymbol ?? locked.tokenAddress} at ${bps}bps failed: ${result.error ?? "unknown"}`,
       );
@@ -691,6 +733,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
 
     if (dryRun) this.store.addPaperRealizedPnl(pnl);
     else this.store.addRealizedPnl(pnl);
+    if (fullyClosed) this.watchlist.dropNegativeNow(dryRun);
 
     if (
       fullyClosed &&
@@ -774,6 +817,20 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
       `Queued mirrored sell retry ${attempts}/${max} for ${pos.tokenSymbol ?? pos.id} in ${delay}ms`,
     );
   }
+}
+
+function fillDedupeKey(alert: NormalizedAlert): string | null {
+  const trader = (alert.userId ?? alert.traderHandle ?? "").toLowerCase();
+  const mint = (alert.tokenAddress ?? "").toLowerCase();
+  if (!trader || !mint || (alert.alertType !== "buy" && alert.alertType !== "sell")) return null;
+  if (alert.txHash) return `${trader}|${mint}|${alert.alertType}|tx:${alert.txHash}`;
+  if (alert.tradeId) return `${trader}|${mint}|${alert.alertType}|trade:${alert.tradeId}`;
+  if (alert.tradeUsd != null && alert.ts != null) {
+    const ms = alert.ts < 1e12 ? alert.ts * 1000 : alert.ts;
+    const bucket = Math.floor(ms / 120_000);
+    return `${trader}|${mint}|${alert.alertType}|amt:${alert.tradeUsd}|t:${bucket}`;
+  }
+  return null;
 }
 
 function lamports(value: number | undefined): string | null {

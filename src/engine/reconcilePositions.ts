@@ -50,7 +50,21 @@ export async function reconcileOpenPositions(opts: {
         log.warn(`position reconcile unreadable book for ${trader} token ${pos.tokenAddress}`);
         continue;
       }
-      if (state === "flat") {
+      if (state === "open") {
+        opts.store.clearFlatConfirm(trader, pos.tokenAddress);
+        continue;
+      }
+      if (state === "absent") {
+        const n = opts.store.bumpFlatConfirm(trader, pos.tokenAddress);
+        if (n < 2) {
+          skipped++;
+          log.info(
+            `position reconcile: ${trader} missing ${pos.tokenAddress} (${n}/2) — not exiting yet`,
+          );
+          continue;
+        }
+      }
+      if (state === "flat" || state === "absent") {
         flat++;
         log.info(
           `position reconcile: ${trader} flat on ${pos.tokenSymbol ?? pos.tokenAddress} — exiting`,

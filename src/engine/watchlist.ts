@@ -64,6 +64,7 @@ export class Watchlist {
   private active: WatchedTrader[] = [];
   private alumni: Map<string, WatchedTrader> = new Map();
   private timer: NodeJS.Timeout | null = null;
+  private paperBook = false;
 
   constructor(
     private readonly cfg: AppConfig,
@@ -71,6 +72,11 @@ export class Watchlist {
     private readonly onChange?: (change: WatchlistChange) => void | Promise<void>,
     private readonly store?: Store | null,
   ) {}
+
+  /** Dry-run cutoff reads dry_closed only. Live cutoff reads closed only. */
+  usePaperBook(on: boolean): void {
+    this.paperBook = on;
+  }
 
   listActive(): WatchedTrader[] {
     return [...this.active];
@@ -177,6 +183,29 @@ export class Watchlist {
     }
   }
 
+  /** Recompute the cutoff immediately. Paper closes never mix into the live book. */
+  dropNegativeNow(paper: boolean): string[] {
+    if (!this.cfg.leaderboard.autoDropNegativePnl || !this.store) return [];
+    const minCloses = this.cfg.leaderboard.autoDropMinCloses;
+    const dropped: string[] = [];
+    this.active = this.active.filter((t) => {
+      const stats = this.store!.traderRealizedStats(t.userId, t.handle ?? null, {
+        book: paper ? "paper" : "live",
+      });
+      if (stats.closes >= minCloses && stats.realizedPnlUsd < 0) {
+        this.alumni.set(t.userId, { ...t, activeForEntries: false });
+        dropped.push(t.userId);
+        log.warn(
+          `Auto-drop ${t.handle ?? t.userId} after close: ${stats.closes} ${paper ? "paper" : "live"} closes, realized $${stats.realizedPnlUsd.toFixed(2)}`,
+        );
+        return false;
+      }
+      return true;
+    });
+    if (dropped.length) this.persistAlumni();
+    return dropped;
+  }
+
   async refresh(reason: string): Promise<WatchlistChange> {
     const prev = [...this.active];
     let next: WatchedTrader[];
@@ -210,7 +239,7 @@ export class Watchlist {
       const minCloses = this.cfg.leaderboard.autoDropMinCloses;
       next = next.filter((t) => {
         const stats = this.store!.traderRealizedStats(t.userId, t.handle ?? null, {
-          includeDryRun: false,
+          book: this.paperBook ? "paper" : "live",
         });
         if (stats.closes >= minCloses && stats.realizedPnlUsd < 0) {
           log.warn(

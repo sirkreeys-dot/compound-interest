@@ -14,6 +14,8 @@ export interface SwapRequest {
   dryRun: boolean;
   /** Live buys: pending_swaps row id written before broadcast. */
   pendingId?: string;
+  /** Open position this sell belongs to, so crash recovery can update that row. */
+  positionId?: string;
   /** Live buys: FOMO event id for ledger. */
   sourceEventId?: string;
   traderUserId?: string | null;

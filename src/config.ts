@@ -78,6 +78,10 @@ const configSchema = z.object({
     minLiquidityUsd: z.number().nonnegative().default(10_000),
     /** Token-2022 transfer fee above this bps fails closed. */
     maxTransferFeeBps: z.number().int().nonnegative().default(100),
+    /** Pools younger than this are treated as fake liquidity. 0 disables the age check. */
+    minPairAgeSec: z.number().int().nonnegative().default(1800),
+    /** Sell impact above this, while DexScreener liquidity clears the floor, is fake depth. */
+    fakeLiquidityImpactBps: z.number().int().nonnegative().default(1000),
   }),
   risk: z.object({
     trailingStopPct: z.number().nonnegative().default(20),
@@ -141,6 +145,12 @@ export interface EnvConfig {
   configPath: string;
   dataDir: string;
   killSwitchPath: string;
+  /**
+   * Public Solana address used as Jupiter taker during DRY_RUN so the sell
+   * simulation can be built without a private key. Empty means that simulation
+   * is skipped (labeled dryRunSellSim=no_public_key).
+   */
+  dryRunSolanaPubkey?: string;
   /** Optional env overrides for watchlist (applied after yaml). */
   traderSource?: TraderSource;
   leaderboardWindow?: LeaderboardWindow;
@@ -212,6 +222,7 @@ export function loadEnv(): EnvConfig {
     configPath: process.env.CONFIG_PATH ?? "./config.yaml",
     dataDir: process.env.DATA_DIR ?? "./data",
     killSwitchPath: process.env.KILL_SWITCH_PATH ?? "./kill.switch",
+    dryRunSolanaPubkey: process.env.DRY_RUN_SOLANA_PUBKEY?.trim() || undefined,
     traderSource:
       source === "manual" || source === "leaderboard" ? source : undefined,
     leaderboardWindow: parseWindow(process.env.LEADERBOARD_WINDOW),

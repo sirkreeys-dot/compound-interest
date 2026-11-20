@@ -4,6 +4,7 @@
  * Env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
  * Commands (restricted to TELEGRAM_CHAT_ID): /status /positions /pause /resume /help
  */
+import { fetchRetry } from "../utils/http.js";
 import { log } from "../utils/logger.js";
 import type { KillSwitch } from "../utils/killswitch.js";
 import type { Store } from "../store/db.js";
@@ -86,7 +87,7 @@ export class TelegramNotifier {
       return;
     }
     try {
-      const res = await fetch(`${API}/bot${this.token}/sendMessage`, {
+      const res = await fetchRetry(`${API}/bot${this.token}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -228,7 +229,7 @@ export class TelegramNotifier {
   private async pollUpdates(): Promise<void> {
     // Token is required by Telegram HTTP API path design; never log this URL.
     const url = `${API}/bot${this.token}/getUpdates?timeout=0&offset=${this.offset}&allowed_updates=${encodeURIComponent(JSON.stringify(["message", "edited_message"]))}`;
-    const res = await fetch(url);
+    const res = await fetchRetry(url, {}, { timeoutMs: 10_000, retries: 2 });
     if (!res.ok) return;
     const data = (await res.json()) as {
       ok?: boolean;

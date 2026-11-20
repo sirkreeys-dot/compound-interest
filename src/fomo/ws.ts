@@ -73,7 +73,9 @@ export class FomoAlertSocket {
     if (this.trader) params.set("trader", this.trader);
     // Never log the API key
     log.info(`Connecting FOMO /ws/alerts trader=${this.trader || "(all)"}…`);
-    const ws = new WebSocket(`wss://api.fomoapi.io/ws/alerts?${params.toString()}`);
+    const ws = new WebSocket(`wss://api.fomoapi.io/ws/alerts?${params.toString()}`, {
+      handshakeTimeout: 10_000,
+    });
     this.ws = ws;
 
     ws.on("open", () => {

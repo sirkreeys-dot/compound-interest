@@ -79,7 +79,9 @@ export class Store {
         tx_signature TEXT,
         position_id TEXT,
         error TEXT,
-        notes TEXT
+        notes TEXT,
+        blockhash TEXT,
+        last_valid_block_height INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_swaps(status);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_source_event
@@ -142,6 +144,13 @@ export class Store {
     const dailyCols2 = this.db.prepare(`PRAGMA table_info(daily_stats)`).all() as Array<{ name: string }>;
     if (!dailyCols2.some((c) => c.name === "paper_spent_usd")) {
       this.db.exec(`ALTER TABLE daily_stats ADD COLUMN paper_spent_usd REAL NOT NULL DEFAULT 0`);
+    }
+    const pendingCols = this.db.prepare(`PRAGMA table_info(pending_swaps)`).all() as Array<{ name: string }>;
+    if (!pendingCols.some((c) => c.name === "blockhash")) {
+      this.db.exec(`ALTER TABLE pending_swaps ADD COLUMN blockhash TEXT`);
+    }
+    if (!pendingCols.some((c) => c.name === "last_valid_block_height")) {
+      this.db.exec(`ALTER TABLE pending_swaps ADD COLUMN last_valid_block_height INTEGER`);
     }
     const retryCols = this.db.prepare(`PRAGMA table_info(sell_retries)`).all() as Array<{ name: string }>;
     if (retryCols.length && !retryCols.some((c) => c.name === "our_fraction")) {
@@ -556,15 +565,41 @@ export class Store {
     this.setMeta(key, String(ts));
   }
 
-  /** Positions left in 'closing' by a crash go back to open so exits can run again. */
+  /**
+   * Positions left in 'closing' go back to open so exits can run again.
+   * Rows with a sent-but-unconfirmed pending swap stay closing so we do not sell twice.
+   */
   resetStuckClosing(): number {
     const result = this.db
       .prepare(
         `UPDATE positions SET status = CASE WHEN is_dry_run = 1 THEN 'dry_open' ELSE 'open' END
-         WHERE status = 'closing'`,
+         WHERE status = 'closing'
+           AND NOT EXISTS (
+             SELECT 1 FROM pending_swaps p
+             WHERE p.status IN ('pending_broadcast','broadcast','confirmed','unresolved','unknown')
+               AND (
+                 p.position_id = positions.id
+                 OR (
+                   p.position_id IS NULL AND p.side = 'sell'
+                   AND lower(p.token_address) = lower(positions.token_address)
+                 )
+               )
+           )`,
       )
       .run() as { changes?: number };
     return result.changes ?? 0;
+  }
+
+  /** Trust the wallet balance over a quoted fill. Scaled remaining USD keeps the next sell sized. */
+  syncPositionToWallet(id: string, quantityRaw: string, remainingUsd: number): void {
+    this.db
+      .prepare(
+        `UPDATE positions
+         SET quantity_raw = ?, remaining_usd = ?,
+             status = CASE WHEN is_dry_run = 1 THEN 'dry_open' ELSE 'open' END
+         WHERE id = ?`,
+      )
+      .run(quantityRaw, remainingUsd, id);
   }
 
   setTraderTokenAmount(id: string, amount: number): void {
@@ -923,6 +958,7 @@ export class Store {
     inAmountRaw?: string | null;
     expectedOutRaw?: string | null;
     notes?: string | null;
+    positionId?: string | null;
   }): void {
     const now = new Date().toISOString();
     this.db
@@ -931,8 +967,8 @@ export class Store {
           id, created_at, updated_at, status, chain, side, source_event_id,
           trader_user_id, trader_handle, token_address, token_symbol, size_usd,
           sell_token, buy_token, in_amount_raw, expected_out_raw, tx_signature,
-          position_id, error, notes
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          position_id, error, notes, blockhash, last_valid_block_height
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         p.id,
@@ -952,9 +988,11 @@ export class Store {
         p.inAmountRaw ?? null,
         p.expectedOutRaw ?? null,
         null,
-        null,
+        p.positionId ?? null,
         null,
         p.notes ?? null,
+        null,
+        null,
       );
   }
 
@@ -968,6 +1006,8 @@ export class Store {
       notes?: string | null;
       inAmountRaw?: string | null;
       expectedOutRaw?: string | null;
+      blockhash?: string | null;
+      lastValidBlockHeight?: number | null;
     },
   ): void {
     const cur = this.getPendingSwap(id);
@@ -976,7 +1016,8 @@ export class Store {
     this.db
       .prepare(
         `UPDATE pending_swaps SET updated_at=?, status=?, tx_signature=?, position_id=?,
-         error=?, notes=?, in_amount_raw=?, expected_out_raw=? WHERE id=?`,
+         error=?, notes=?, in_amount_raw=?, expected_out_raw=?, blockhash=?,
+         last_valid_block_height=? WHERE id=?`,
       )
       .run(
         now,
@@ -987,6 +1028,8 @@ export class Store {
         patch.notes !== undefined ? patch.notes : cur.notes,
         patch.inAmountRaw !== undefined ? patch.inAmountRaw : cur.inAmountRaw,
         patch.expectedOutRaw !== undefined ? patch.expectedOutRaw : cur.expectedOutRaw,
+        patch.blockhash !== undefined ? patch.blockhash : cur.blockhash,
+        patch.lastValidBlockHeight !== undefined ? patch.lastValidBlockHeight : cur.lastValidBlockHeight,
         id,
       );
   }
@@ -1003,7 +1046,7 @@ export class Store {
     const rows = this.db
       .prepare(
         `SELECT * FROM pending_swaps WHERE status IN (
-           'pending_broadcast','broadcast','confirmed','unresolved'
+           'pending_broadcast','broadcast','confirmed','unresolved','unknown'
          ) ORDER BY created_at ASC`,
       )
       .all() as Record<string, unknown>[];
@@ -1024,7 +1067,9 @@ export type PendingSwapStatus =
   | "confirmed"
   | "failed"
   | "reconciled"
-  | "unresolved";
+  | "unresolved"
+  | "expired"
+  | "unknown";
 
 export interface PendingSwap {
   id: string;
@@ -1047,6 +1092,8 @@ export interface PendingSwap {
   positionId: string | null;
   error: string | null;
   notes: string | null;
+  blockhash: string | null;
+  lastValidBlockHeight: number | null;
 }
 
 
@@ -1152,6 +1199,9 @@ function rowToPending(row: Record<string, unknown>): PendingSwap {
     positionId: row.position_id != null ? String(row.position_id) : null,
     error: row.error != null ? String(row.error) : null,
     notes: row.notes != null ? String(row.notes) : null,
+    blockhash: row.blockhash != null ? String(row.blockhash) : null,
+    lastValidBlockHeight:
+      row.last_valid_block_height != null ? Number(row.last_valid_block_height) : null,
   };
 }
 

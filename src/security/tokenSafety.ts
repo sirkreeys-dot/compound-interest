@@ -2,7 +2,8 @@
  * Solana token safety: freeze authority + Token-2022 transfer hooks / transfer fees.
  * Uses getParsedAccountInfo — FOMO alerts alone are never enough to trust a mint.
  */
-import { Connection, PublicKey } from "@solana/web3.js";
+import { PublicKey } from "@solana/web3.js";
+import { fetchRetry, rpcConnection } from "../utils/http.js";
 import { log } from "../utils/logger.js";
 
 export type TokenSafetyMode = "block" | "warn" | "off";
@@ -78,7 +79,7 @@ export async function inspectSolanaMint(
   if (mode === "off") return finding;
 
   try {
-    const conn = new Connection(rpcUrl, "confirmed");
+    const conn = rpcConnection(rpcUrl);
     const pk = new PublicKey(mint);
     const injected = opts.getParsedAccountInfo
       ? await opts.getParsedAccountInfo(mint)
@@ -308,16 +309,20 @@ export async function fetchLargestHolderAmount(
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ amount: bigint | null; failed: boolean }> {
   try {
-    const res = await fetchImpl(rpcUrl, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getTokenLargestAccounts",
-        params: [mint],
-      }),
-    });
+    const res = await fetchRetry(
+      rpcUrl,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getTokenLargestAccounts",
+          params: [mint],
+        }),
+      },
+      { timeoutMs: 12_000, retries: 0, fetchImpl },
+    );
     if (!res.ok) return { amount: null, failed: true };
     const body = (await res.json()) as {
       error?: { message?: string };
@@ -365,7 +370,11 @@ export async function fetchDexScreenerLiquidity(
   fetchImpl: typeof fetch = fetch,
 ): Promise<{ liquidityUsd: number | null; fetchFailed: boolean }> {
   try {
-    const res = await fetchImpl(`https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mint)}`);
+    const res = await fetchRetry(
+      `https://api.dexscreener.com/latest/dex/tokens/${encodeURIComponent(mint)}`,
+      {},
+      { timeoutMs: 10_000, retries: 2, fetchImpl },
+    );
     if (!res.ok) return { liquidityUsd: null, fetchFailed: true };
     const body = (await res.json()) as unknown;
     const liquidityUsd = liquidityUsdFromDexScreener(body);

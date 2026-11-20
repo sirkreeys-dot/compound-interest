@@ -669,6 +669,7 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
         sellAmountRaw: sellRaw,
         slippageBps: bps,
         dryRun,
+        positionId: locked.id,
       });
       if (result.ok) break;
       if (result.inFlight) {

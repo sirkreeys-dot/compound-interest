@@ -105,6 +105,10 @@ export interface AppConfig {
     minLiquidityUsd: number;
     /** Block Token-2022 transfer fees above this many bps. */
     maxTransferFeeBps: number;
+    /** Block pools younger than this. 0 disables. */
+    minPairAgeSec: number;
+    /** Block when a deep DexScreener pool still shows this much sell impact. */
+    fakeLiquidityImpactBps: number;
   };
   risk: {
     /**

@@ -8,6 +8,7 @@ import {
   VersionedTransaction,
   type SimulatedTransactionResponse,
 } from "@solana/web3.js";
+import { rpcConnection } from "../utils/http.js";
 import { log } from "../utils/logger.js";
 
 export const TOKEN_PROGRAM_ID = new PublicKey(
@@ -332,11 +333,7 @@ export async function simulateAndValidateSwap(
 
   const conn =
     opts.connection ??
-    new Connection(opts.rpcUrl, {
-      commitment: "confirmed",
-      // Avoid ws side-effects in Node for one-shot sim
-      disableRetryOnRateLimit: false,
-    });
+    rpcConnection(opts.rpcUrl);
 
   const inputMintPk = new PublicKey(opts.inputMint);
   const outputMintPk = new PublicKey(opts.outputMint);

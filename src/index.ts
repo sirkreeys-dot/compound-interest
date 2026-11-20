@@ -132,12 +132,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const stuck = store.resetStuckClosing();
-  if (stuck > 0) {
-    log.warn(`Reset ${stuck} position(s) stuck in 'closing' back to open so exits can run`);
-  }
-
-  // Reconcile any pending live swaps left from a prior crash
+  // Resolve signed-but-unconfirmed swaps before reopening 'closing' rows.
   try {
     const { reconcilePendingSwaps } = await import("./store/reconcilePending.js");
     await reconcilePendingSwaps({
@@ -149,6 +144,11 @@ async function main(): Promise<void> {
     });
   } catch (e) {
     log.warn("Pending swap reconciliation failed", e);
+  }
+
+  const stuck = store.resetStuckClosing();
+  if (stuck > 0) {
+    log.warn(`Reset ${stuck} position(s) stuck in 'closing' back to open so exits can run`);
   }
 
   const traders = watchlist.subscribeKeysWithOpen(openTraderKeys());
@@ -263,6 +263,15 @@ async function main(): Promise<void> {
       log.warn(`sell retry drain failed: ${e instanceof Error ? e.message : String(e)}`);
     });
   }, 5_000);
+  const pendingTimer = setInterval(() => {
+    void import("./store/reconcilePending.js")
+      .then(({ reconcilePendingSwaps }) =>
+        reconcilePendingSwaps({ store, env, cfg, tg, rpcUrl: env.solanaRpcUrl }),
+      )
+      .catch((e) => {
+        log.warn(`pending recheck failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+  }, 30_000);
 
   const reconcile = startPositionReconcileLoop({
     cfg,
@@ -282,6 +291,7 @@ async function main(): Promise<void> {
     if (restTimer) clearInterval(restTimer);
     clearInterval(tpSlTimer);
     clearInterval(retryTimer);
+    clearInterval(pendingTimer);
     reconcile?.stop();
     store.close();
     process.exit(0);

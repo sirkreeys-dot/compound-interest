@@ -10,6 +10,7 @@ import {
   TransactionInstruction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import { rpcConnection } from "../utils/http.js";
 import {
   TOKEN_2022_PROGRAM_ID,
   TOKEN_PROGRAM_ID,
@@ -59,7 +60,7 @@ export async function closeEmptyTokenAccount(opts: {
     return { ok: false, closed: false, error: "invalid mint" };
   }
   const conn =
-    opts.connection ?? new Connection(opts.rpcUrl, { commitment: "confirmed" });
+    opts.connection ?? rpcConnection(opts.rpcUrl);
   try {
     const mintInfo = await conn.getAccountInfo(mintPk, "confirmed");
     if (!mintInfo) return { ok: true, closed: false, error: "mint account missing" };

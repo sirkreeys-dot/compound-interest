@@ -60,6 +60,8 @@ filters:
   # DexScreener liquidity floor. $10k drops pools where a $2 swap is mostly impact.
   # Lookup failure blocks. 0 disables.
   minLiquidityUsd: 10000
+  minPairAgeSec: 1800             # pools younger than 30 minutes are treated as fake liquidity
+  fakeLiquidityImpactBps: 1000    # sell impact above 10% while DexScreener still shows the $10k floor
 
 risk:
   # No fixed take-profit. A trader sell under 10% of their position is ignored.

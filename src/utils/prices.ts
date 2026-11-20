@@ -6,6 +6,7 @@
  * Jupiter: GET https://api.jup.ag/price/v3?ids=<mint> → { [mint]: { usdPrice, blockId, decimals } }
  * 0x: GET https://api.0x.org/swap/allowance-holder/price?chainId=8453&sellToken=0xEeee…&buyToken=USDC&sellAmount=1e18
  */
+import { fetchRetry } from "./http.js";
 import { log } from "./logger.js";
 import { ZEROX_NATIVE_ETH } from "./money.js";
 
@@ -160,6 +161,10 @@ export class PriceService {
     return null;
   }
 
+  private http(url: string, init?: RequestInit): Promise<Response> {
+    return fetchRetry(url, init ?? {}, { timeoutMs: 10_000, retries: 2, fetchImpl: this.fetchImpl });
+  }
+
   private getFreshCached(key: string, maxAge: number): FreshPrice | null {
     const c = this.cache.get(key);
     if (!c) return null;
@@ -170,7 +175,7 @@ export class PriceService {
   private async fetchJupiterPriceV3(mint: string): Promise<FreshPrice | null> {
     const headers: Record<string, string> = {};
     if (this.jupiterApiKey) headers["x-api-key"] = this.jupiterApiKey;
-    const res = await this.fetchImpl(`https://api.jup.ag/price/v3?ids=${mint}`, { headers });
+    const res = await this.http(`https://api.jup.ag/price/v3?ids=${mint}`, { headers });
     if (!res.ok) return null;
     const body = (await res.json()) as Record<
       string,
@@ -195,7 +200,7 @@ export class PriceService {
       outputMint: USDC_SOL,
       amount: "1000000000", // 1 SOL
     });
-    const res = await this.fetchImpl(`https://api.jup.ag/swap/v2/order?${params}`, { headers });
+    const res = await this.http(`https://api.jup.ag/swap/v2/order?${params}`, { headers });
     if (!res.ok) return null;
     const order = (await res.json()) as {
       outAmount?: string;
@@ -228,7 +233,7 @@ export class PriceService {
       buyToken: USDC_BASE,
       sellAmount: "1000000000000000000", // 1 ETH
     });
-    const res = await this.fetchImpl(
+    const res = await this.http(
       `https://api.0x.org/swap/allowance-holder/price?${params}`,
       {
         headers: {
@@ -253,7 +258,7 @@ export class PriceService {
     const cached = this.getFreshCached(cacheKey, this.cgMaxAgeMs);
     if (cached && cached.source === "coingecko_fallback") return cached;
 
-    const res = await this.fetchImpl(
+    const res = await this.http(
       `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`,
     );
     if (!res.ok) return null;

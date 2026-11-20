@@ -3,6 +3,7 @@ import path from "node:path";
 import dotenv from "dotenv";
 import yaml from "js-yaml";
 import { z } from "zod";
+import { DEFAULT_SOLANA_PROGRAM_ALLOWLIST } from "./security/programAllowlist.js";
 import type { AppConfig, LeaderboardWindow, TraderSource } from "./types.js";
 
 dotenv.config();
@@ -25,14 +26,20 @@ const configSchema = z.object({
   traderSource: z.enum(["leaderboard", "manual"]).default("leaderboard"),
   leaderboard: z
     .object({
-      window: windowSchema.default("7d"),
+      window: windowSchema.default("30d"),
       topN: z.number().int().positive().default(3),
       refreshHours: z.number().positive().default(6),
+      minTrades: z.number().int().nonnegative().default(0),
+      autoDropNegativePnl: z.boolean().default(true),
+      autoDropMinCloses: z.number().int().positive().default(3),
     })
     .default({
-      window: "7d",
+      window: "30d",
       topN: 3,
       refreshHours: 6,
+      minTrades: 0,
+      autoDropNegativePnl: true,
+      autoDropMinCloses: 3,
     }),
   traders: z
     .array(
@@ -54,6 +61,8 @@ const configSchema = z.object({
     percentOfTrader: z.number().positive().default(10),
     maxUsdPerTrade: z.number().positive().default(5),
     minTraderTradeUsd: z.number().nonnegative().default(0),
+    mergeRebuys: z.boolean().default(true),
+    maxUsdPerToken: z.number().nonnegative().default(5),
   }),
   filters: z.object({
     marketCapMinUsd: z.number().nonnegative().default(0),
@@ -63,19 +72,43 @@ const configSchema = z.object({
     tokenSafety: z.enum(["block", "warn", "off"]).default("block"),
     blockFreezeAuthority: z.boolean().default(true),
     blockTransferHooks: z.boolean().default(true),
+    blockMintAuthority: z.boolean().default(true),
+    maxTopHolderBps: z.number().int().nonnegative().default(9000),
+    roundTripMaxLossBps: z.number().int().nonnegative().default(2500),
+    minLiquidityUsd: z.number().nonnegative().default(10_000),
+    /** Token-2022 transfer fee above this bps fails closed. */
+    maxTransferFeeBps: z.number().int().nonnegative().default(100),
+    /** Pools younger than this are treated as fake liquidity. 0 disables the age check. */
+    minPairAgeSec: z.number().int().nonnegative().default(1800),
+    /** Sell impact above this, while DexScreener liquidity clears the floor, is fake depth. */
+    fakeLiquidityImpactBps: z.number().int().nonnegative().default(1000),
   }),
   risk: z.object({
-    takeProfitPct: z.number().nonnegative().default(50),
+    trailingStopPct: z.number().nonnegative().default(20),
     stopLossPct: z.number().nonnegative().default(25),
+    maxHoldMinutes: z.number().int().nonnegative().default(0),
     maxSlippageBps: z.number().int().positive().default(300),
+    sellSlippageBps: z.array(z.number().int().positive()).min(1).default([300, 1000, 2500]),
     maxChaseBps: z.number().int().nonnegative().default(500),
     dailyBudgetUsd: z.number().positive().default(40),
+    dailyLossLimitUsd: z.number().nonnegative().default(20),
     maxOpenPositions: z.number().int().positive().default(10),
     cooldownSeconds: z.number().int().nonnegative().default(30),
     copySells: z.boolean().default(true),
     simulateBeforeSign: z.boolean().default(true),
     simMaxExtraLamports: z.number().int().nonnegative().default(50_000),
+    simMaxFeeLamports: z.number().int().nonnegative().default(1_000_000),
+    simMaxOverheadLamports: z.number().int().nonnegative().default(3_000_000),
     simMaxExtraTokenOutflow: z.number().int().nonnegative().default(0),
+    closeEmptyTokenAccount: z.boolean().default(true),
+    quoteFailWriteoffCount: z.number().int().positive().default(5),
+    mirroredSellMaxRetries: z.number().int().positive().default(4),
+    /** Jupiter inUsdValue may exceed maxUsdPerTrade by this many bps (fees). */
+    inUsdToleranceBps: z.number().int().nonnegative().default(200),
+    /** Two SOL/USD sources may differ by at most this many bps. */
+    solPriceDivergenceBps: z.number().int().nonnegative().default(250),
+    /** Top-level programs a signed Jupiter tx may call. */
+    solanaProgramAllowlist: z.array(z.string().min(32)).default(DEFAULT_SOLANA_PROGRAM_ALLOWLIST),
   }),
   quote: z.object({
     solanaNative: z.string(),
@@ -86,8 +119,10 @@ const configSchema = z.object({
   }),
   poll: z.object({
     alertsRestEnabled: z.boolean().default(true),
-    alertsRestIntervalSec: z.number().int().positive().default(20),
-    tpSlCheckIntervalSec: z.number().int().positive().default(60),
+    alertsRestOnlyWhenWsDown: z.boolean().default(true),
+    alertsRestIntervalSec: z.number().int().positive().default(90),
+    tpSlCheckIntervalSec: z.number().int().positive().default(15),
+    positionReconcileIntervalSec: z.number().int().nonnegative().default(10_800),
   }),
   logging: z.object({
     level: z.enum(["debug", "info", "warn", "error"]).default("info"),
@@ -110,6 +145,12 @@ export interface EnvConfig {
   configPath: string;
   dataDir: string;
   killSwitchPath: string;
+  /**
+   * Public Solana address used as Jupiter taker during DRY_RUN so the sell
+   * simulation can be built without a private key. Empty means that simulation
+   * is skipped (labeled dryRunSellSim=no_public_key).
+   */
+  dryRunSolanaPubkey?: string;
   /** Optional env overrides for watchlist (applied after yaml). */
   traderSource?: TraderSource;
   leaderboardWindow?: LeaderboardWindow;
@@ -181,6 +222,7 @@ export function loadEnv(): EnvConfig {
     configPath: process.env.CONFIG_PATH ?? "./config.yaml",
     dataDir: process.env.DATA_DIR ?? "./data",
     killSwitchPath: process.env.KILL_SWITCH_PATH ?? "./kill.switch",
+    dryRunSolanaPubkey: process.env.DRY_RUN_SOLANA_PUBKEY?.trim() || undefined,
     traderSource:
       source === "manual" || source === "leaderboard" ? source : undefined,
     leaderboardWindow: parseWindow(process.env.LEADERBOARD_WINDOW),

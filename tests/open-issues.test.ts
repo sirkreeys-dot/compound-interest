@@ -28,6 +28,9 @@ describe("open-issue: fresh prices prefer Jupiter/0x over CoinGecko", () => {
             { status: 200 },
           );
         }
+        if (url.includes("coingecko")) {
+          return new Response(JSON.stringify({ solana: { usd: 151 } }), { status: 200 });
+        }
         return new Response("nope", { status: 500 });
       }),
     });
@@ -46,7 +49,7 @@ describe("open-issue: fresh prices prefer Jupiter/0x over CoinGecko", () => {
         return new Response("{}", { status: 500 });
       }),
     });
-    await assert.rejects(() => ps.getSolUsd(), /No fresh SOL/);
+    await assert.rejects(() => ps.getSolUsd(), /cross-check failed|No fresh SOL/);
   });
 
   it("rawOutToUsd uses fresh SOL price when quote lacks outUsdValue", async () => {
@@ -63,6 +66,9 @@ describe("open-issue: fresh prices prefer Jupiter/0x over CoinGecko", () => {
             }),
             { status: 200 },
           );
+        }
+        if (url.includes("coingecko")) {
+          return new Response(JSON.stringify({ solana: { usd: 100.2 } }), { status: 200 });
         }
         return new Response("{}", { status: 500 });
       }),
@@ -178,14 +184,14 @@ describe("open-issue: FOMO-based sell fraction", () => {
     assert.equal(r.fraction, 1);
   });
 
-  it("falls back to full_exit_fallback when nothing reliable", async () => {
+  it("returns unknown instead of guessing a full exit when nothing reliable", async () => {
     const r = await resolveSellFraction({
       pos: { ...basePos, traderTokenAmountAtEntry: null, traderSizeAtEntryUsd: null },
       fomo: null,
       alert: undefined,
     });
-    assert.equal(r.method, "full_exit_fallback");
-    assert.equal(r.fraction, 1);
+    assert.equal(r.method, "unknown");
+    assert.equal(r.fraction, null);
   });
 });
 

@@ -129,16 +129,24 @@ export function evaluateAlert(alert: NormalizedAlert, ctx: FilterContext): Filte
     // Dry-run positions don't count against live firstBuysOnly / max positions /
     // daily budget — use includeDryRun only when we ourselves are in dry-run.
     const liveOnly = !ctx.dryRun;
+    const traderKey = watched.userId ?? watched.handle ?? alert.userId ?? alert.traderHandle ?? "";
     if (ctx.cfg.filters.firstBuysOnly) {
       if (ctx.store.hasOpenToken(alert.tokenAddress, alert.chain, liveOnly)) {
         return { ok: false, reason: "first_buys_only", detail: "already have open position on token" };
       }
     }
 
+    const merging =
+      ctx.cfg.sizing.mergeRebuys &&
+      !ctx.cfg.filters.firstBuysOnly &&
+      ctx.store.findOpenByTraderToken(traderKey, alert.tokenAddress, alert.chain, {
+        includeDryRun: !liveOnly,
+      }) != null;
+
     const openCount = liveOnly
       ? ctx.store.countOpenLive()
       : ctx.store.listOpen({ includeDryRun: true }).length;
-    if (openCount >= ctx.cfg.risk.maxOpenPositions) {
+    if (!merging && openCount >= ctx.cfg.risk.maxOpenPositions) {
       return {
         ok: false,
         reason: "max_positions",
@@ -146,14 +154,14 @@ export function evaluateAlert(alert: NormalizedAlert, ctx: FilterContext): Filte
       };
     }
 
-    const last = ctx.store.lastEntryAt();
+    const last = ctx.store.lastEntryAt(traderKey);
     if (last && ctx.cfg.risk.cooldownSeconds > 0) {
       const elapsed = (Date.now() - last) / 1000;
       if (elapsed < ctx.cfg.risk.cooldownSeconds) {
         return {
           ok: false,
           reason: "cooldown",
-          detail: `${Math.ceil(ctx.cfg.risk.cooldownSeconds - elapsed)}s left`,
+          detail: `${traderKey} ${Math.ceil(ctx.cfg.risk.cooldownSeconds - elapsed)}s left`,
         };
       }
     }
@@ -174,15 +182,38 @@ export function evaluateAlert(alert: NormalizedAlert, ctx: FilterContext): Filte
       };
     }
 
-    // Daily budget from persisted SQLite — survives restarts. Dry-run does not
-    // inflate live spent_usd (copy engine only addSpend when !dryRun).
-    if (!ctx.dryRun) {
-      const daily = ctx.store.getDaily();
-      if (daily.spentUsd + sizeUsd > ctx.cfg.risk.dailyBudgetUsd) {
+    const tokenCap = ctx.cfg.sizing.maxUsdPerToken ?? 0;
+    if (tokenCap > 0) {
+      const exposure = ctx.store.tokenExposureUsd(alert.tokenAddress, alert.chain, liveOnly);
+      if (exposure + sizeUsd > tokenCap) {
         return {
           ok: false,
-          reason: "daily_budget",
-          detail: `spent ${daily.spentUsd} + ${sizeUsd} > ${ctx.cfg.risk.dailyBudgetUsd}`,
+          reason: "token_cap",
+          detail: `exposure ${exposure} + ${sizeUsd} > maxUsdPerToken ${tokenCap}`,
+        };
+      }
+    }
+
+    // Daily budget and the realized-loss pause both key off UTC daily_stats
+    // (date = YYYY-MM-DD from toISOString). They reset at 00:00 UTC.
+    // Dry-run does not inflate live spent_usd. Paper losses use a separate column.
+    const daily = ctx.store.getDaily();
+    const spent = ctx.dryRun ? daily.paperSpentUsd : daily.spentUsd;
+    if (spent + sizeUsd > ctx.cfg.risk.dailyBudgetUsd) {
+      return {
+        ok: false,
+        reason: "daily_budget",
+        detail: `spent ${spent} + ${sizeUsd} > ${ctx.cfg.risk.dailyBudgetUsd} (resets 00:00 UTC)`,
+      };
+    }
+    const lossLimit = ctx.cfg.risk.dailyLossLimitUsd ?? 0;
+    if (lossLimit > 0) {
+      const pnl = ctx.dryRun ? daily.paperRealizedPnlUsd : daily.realizedPnlUsd;
+      if (pnl <= -lossLimit) {
+        return {
+          ok: false,
+          reason: "daily_loss_limit",
+          detail: `realized ${pnl} <= -${lossLimit} (resets 00:00 UTC; sells still allowed)`,
         };
       }
     }

@@ -36,6 +36,16 @@ export interface SwapResult {
   quoteSummary?: string;
   /** Echo pending ledger id when used. */
   pendingId?: string;
+  /** Quote or fill USD value of the sold side, when the venue reports it. */
+  inUsd?: number;
+  /** Signature + priority fees in lamports, when reported. */
+  feeLamports?: number;
+  /** ATA rent charged on the fill, in lamports, when reported. */
+  rentLamports?: number;
+  /** Lamports of SOL actually spent (native-SOL input only). */
+  solInLamports?: string;
+  /** Lamports of SOL actually received (native-SOL output only). */
+  solOutLamports?: string;
 }
 
 export interface Executor {

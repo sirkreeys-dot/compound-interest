@@ -56,13 +56,18 @@ export type TraderSource = "leaderboard" | "manual";
 export type SizingMode = "fixed_usd" | "percent_of_trader";
 
 export interface AppConfig {
-  /** Default: leaderboard (top N on weekly board). */
+  /** Default: leaderboard (top N). */
   traderSource: TraderSource;
   leaderboard: {
-    /** Exact FOMO window: 24h | 7d | 30d | all. Weekly = 7d. */
+    /** Exact FOMO window: 24h | 7d | 30d | all. Default 30d. */
     window: LeaderboardWindow;
     topN: number;
     refreshHours: number;
+    /** Drop a leaderboard row when it exposes a trade count below this. 0 = off. */
+    minTrades: number;
+    /** Stop new entries from traders whose copied closes are net-negative after N closes. */
+    autoDropNegativePnl: boolean;
+    autoDropMinCloses: number;
   };
   /** Used when traderSource=manual. Ignored for entries when leaderboard mode. */
   traders: TraderConfig[];
@@ -73,6 +78,10 @@ export interface AppConfig {
     percentOfTrader: number;
     maxUsdPerTrade: number;
     minTraderTradeUsd: number;
+    /** When true (and firstBuysOnly is false), later buys add to the open position. */
+    mergeRebuys: boolean;
+    /** Max cumulative open cost basis per token. 0 = no extra cap. */
+    maxUsdPerToken: number;
   };
   filters: {
     marketCapMinUsd: number;
@@ -83,22 +92,73 @@ export interface AppConfig {
     tokenSafety: "block" | "warn" | "off";
     blockFreezeAuthority: boolean;
     blockTransferHooks: boolean;
+    /** Block buys while the mint authority is still set. */
+    blockMintAuthority: boolean;
+    /** Skip buys older than this many seconds. 0 disables. Missing ts fails closed when > 0. */
+    maxAlertAgeSec: number;
+    /** Block when the largest token account holds more than this share. 0 disables. */
+    maxTopHolderBps: number;
+    /** Block when a sell quote of the buy output loses more than this vs USD in. 0 disables. */
+    roundTripMaxLossBps: number;
+    /** Block when external liquidity is below this USD. 0 disables. Fail closed when enabled. */
+    minLiquidityUsd: number;
   };
   risk: {
+    /** TP1 threshold vs cost basis. 0 disables. */
     takeProfitPct: number;
+    /** Fraction of the bag to sell at TP1. 1 = full exit. Remainder trails. */
+    takeProfitSellFraction: number;
+    /** After TP1 (or immediately if TP is off), exit when mark falls this % from the peak. 0 disables. */
+    trailingStopPct: number;
     stopLossPct: number;
+    /** Full exit after this many minutes. 0 disables. */
+    maxHoldMinutes: number;
+    /** Buy slippage cap (bps). */
     maxSlippageBps: number;
+    /**
+     * Escalating sell slippage attempts in bps. The first value that lands wins.
+     * Default 300, 1000, 2500.
+     */
+    sellSlippageBps: number[];
+    /**
+     * Max loss between USD spent and the quote's USD out (price impact + fees), in bps.
+     * This is not a comparison to the signal's fill price — alerts do not include one.
+     */
     maxChaseBps: number;
+    /** New-entry notional cap. Resets at 00:00 UTC with daily_stats.date. */
     dailyBudgetUsd: number;
+    /**
+     * Pause new entries once today's realized PnL is at or below -this value.
+     * Sells still run. 0 disables. Resets at 00:00 UTC.
+     */
+    dailyLossLimitUsd: number;
     maxOpenPositions: number;
+    /** Per-trader minimum seconds between our entries. */
     cooldownSeconds: number;
     copySells: boolean;
     /** Simulate Jupiter TX via RPC before signing (live only). Default true. */
     simulateBeforeSign: boolean;
-    /** Extra lamports tolerated beyond expected SOL input / fees. Default 50000. */
+    /**
+     * Slack added on top of Jupiter-reported signature+priority fees, or the
+     * entire unexplained fee budget when the order omits fee fields and
+     * simMaxFeeLamports is not the one applied. Default 50000.
+     */
     simMaxExtraLamports: number;
+    /** Fee budget (lamports) used when Jupiter does not report signature/priority fees. */
+    simMaxFeeLamports: number;
+    /**
+     * Hard ceiling on SOL spent beyond the swap input (ATA rent + signature + priority).
+     * Default 3000000 (~0.003 SOL). Real overspend above this is rejected.
+     */
+    simMaxOverheadLamports: number;
     /** Extra raw token units tolerated on input ATA outflow. Default 0. */
     simMaxExtraTokenOutflow: number;
+    /** After a full Solana exit, close the empty token account and reclaim rent. */
+    closeEmptyTokenAccount: boolean;
+    /** Consecutive failed TP/SL quotes before a position is written off. */
+    quoteFailWriteoffCount: number;
+    /** Failed mirrored-sell attempts (including the first) before giving up on that event. */
+    mirroredSellMaxRetries: number;
   };
   quote: {
     solanaNative: string;
@@ -109,8 +169,17 @@ export interface AppConfig {
   };
   poll: {
     alertsRestEnabled: boolean;
+    /** When true, REST /v2/alerts runs only while no FOMO alert socket is open. */
+    alertsRestOnlyWhenWsDown: boolean;
+    /** REST poll interval. Used as the WS-down fallback cadence (and always, if onlyWhenWsDown is false). */
     alertsRestIntervalSec: number;
     tpSlCheckIntervalSec: number;
+    /**
+     * How often to compare open positions to the trader's FOMO positions.
+     * Each cycle costs one normal read (250 credits) per trader who still has an open position.
+     * 0 disables. Default 10800 (3h) so a top-3 book stays inside a free-tier month.
+     */
+    positionReconcileIntervalSec: number;
   };
   logging: { level: "debug" | "info" | "warn" | "error" };
 }
@@ -135,8 +204,15 @@ export interface OpenPosition {
   traderTokenAmountAtEntry: number | null;
   openedAt: string;
   sourceEventId: string;
-  /** open | closing (locked) | closed | dry_open | dry_closed */
-  status: "open" | "closing" | "closed" | "dry_open" | "dry_closed";
+  /** open | closing | closed | dry_open | dry_closed | written_off | dry_written_off */
+  status:
+    | "open"
+    | "closing"
+    | "closed"
+    | "dry_open"
+    | "dry_closed"
+    | "written_off"
+    | "dry_written_off";
   isDryRun: boolean;
   closedAt?: string;
   exitUsd?: number;
@@ -144,13 +220,48 @@ export interface OpenPosition {
   realizedPnlUsd?: number;
   txEntry?: string | null;
   txExit?: string | null;
+  /** Actual USD value of the entry fill (quote in-USD, else the sized notional). */
+  usdIn?: number | null;
+  /** Cumulative USD received on sells. */
+  usdOut?: number | null;
+  solInLamports?: string | null;
+  solOutLamports?: string | null;
+  feeLamports?: string | null;
+  rentPaidLamports?: string | null;
+  rentReclaimedLamports?: string | null;
+  /** Highest mark seen since the trailing stop was armed. Null until seeded. */
+  peakMarkUsd?: number | null;
+  tp1Done?: boolean;
+  quoteFailures?: number;
 }
 
 export interface DailyStats {
   date: string;
   spentUsd: number;
   realizedPnlUsd: number;
+  /** Paper PnL from DRY_RUN closes. Does not affect the live loss limit. */
+  paperRealizedPnlUsd: number;
   trades: number;
+}
+
+export interface TraderStats {
+  traderUserId: string | null;
+  traderHandle: string | null;
+  closes: number;
+  wins: number;
+  realizedPnlUsd: number;
+}
+
+export interface SkipRecord {
+  id: number;
+  ts: string;
+  eventId: string | null;
+  reason: string;
+  detail: string | null;
+  trader: string | null;
+  tokenAddress: string | null;
+  side: string | null;
+  isDryRun: boolean;
 }
 
 export type SkipReason =
@@ -177,4 +288,10 @@ export type SkipReason =
   | "chase_limit"
   | "execution_failed"
   | "paused"
+  | "stale_alert"
+  | "same_batch_sell"
+  | "token_cap"
+  | "daily_loss_limit"
+  | "round_trip"
+  | "overhead"
   | "other";

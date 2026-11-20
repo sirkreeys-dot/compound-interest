@@ -26,7 +26,33 @@ type LeaderboardRow = {
   handle?: string;
   userId?: string;
   displayName?: string;
+  tradeCount?: number;
+  trades?: number;
+  numTrades?: number;
+  totalTrades?: number;
+  swapCount?: number;
+  fills?: number;
 };
+
+const TRADE_COUNT_KEYS = [
+  "tradeCount",
+  "trades",
+  "numTrades",
+  "totalTrades",
+  "swapCount",
+  "fills",
+] as const;
+
+/** Trade count when the leaderboard row exposes one. Null if the API did not. */
+export function leaderboardTradeCount(row: object): number | null {
+  const rec = row as Record<string, unknown>;
+  for (const key of TRADE_COUNT_KEYS) {
+    const v = rec[key];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
+  }
+  return null;
+}
 
 type LeaderboardResponse = {
   window?: string;
@@ -180,6 +206,22 @@ export class Watchlist {
       next = await this.fetchLeaderboardTop();
     }
 
+    if (this.cfg.leaderboard.autoDropNegativePnl && this.store) {
+      const minCloses = this.cfg.leaderboard.autoDropMinCloses;
+      next = next.filter((t) => {
+        const stats = this.store!.traderRealizedStats(t.userId, t.handle ?? null, {
+          includeDryRun: false,
+        });
+        if (stats.closes >= minCloses && stats.realizedPnlUsd < 0) {
+          log.warn(
+            `Auto-drop ${t.handle ?? t.userId}: ${stats.closes} copied closes, realized $${stats.realizedPnlUsd.toFixed(2)}`,
+          );
+          return false;
+        }
+        return true;
+      });
+    }
+
     const prevIds = new Set(prev.map((t) => t.userId));
     const nextIds = new Set(next.map((t) => t.userId));
     const added = next.filter((t) => !prevIds.has(t.userId));
@@ -227,9 +269,19 @@ export class Watchlist {
 
     const rows = Array.isArray(body.traders) ? body.traders : [];
     const out: WatchedTrader[] = [];
+    const minTrades = this.cfg.leaderboard.minTrades ?? 0;
+    let sawTradeCount = false;
     for (const row of rows.slice(0, topN)) {
       if (!row.userId) {
         log.warn(`Leaderboard row missing userId (handle=${row.handle}) — skipped`);
+        continue;
+      }
+      const trades = leaderboardTradeCount(row);
+      if (trades != null) sawTradeCount = true;
+      if (minTrades > 0 && trades != null && trades < minTrades) {
+        log.info(
+          `Leaderboard skip ${row.handle ?? row.userId}: trades=${trades} < minTrades ${minTrades}`,
+        );
         continue;
       }
       out.push({
@@ -243,6 +295,11 @@ export class Watchlist {
         activeForEntries: true,
         source: "leaderboard",
       });
+    }
+    if (minTrades > 0 && rows.length > 0 && !sawTradeCount) {
+      log.warn(
+        `Leaderboard ${window} rows did not include a trade count (tradeCount/trades/numTrades/totalTrades/swapCount/fills); minTrades=${minTrades} was not applied`,
+      );
     }
     if (!out.length) {
       log.warn(`Leaderboard ${window} returned 0 traders with userId`);

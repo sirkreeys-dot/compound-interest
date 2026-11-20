@@ -1,13 +1,17 @@
 # Who to copy
 # traderSource: leaderboard (default) | manual
 # Leaderboard uses FOMO GET /v2/leaderboard/{window} — window values from docs: 24h | 7d | 30d | all
-# "Weekly" = 7d. Env overrides: TRADER_SOURCE, LEADERBOARD_WINDOW, LEADERBOARD_TOP_N, LEADERBOARD_REFRESH_HOURS
+# Default window is 30d. "Weekly" = 7d. Env overrides: TRADER_SOURCE, LEADERBOARD_WINDOW, LEADERBOARD_TOP_N, LEADERBOARD_REFRESH_HOURS
 traderSource: leaderboard
 
 leaderboard:
-  window: 7d               # FOMO path value (weekly board)
+  window: 30d              # FOMO path value. 24h | 7d | 30d | all
   topN: 3                  # copy top 3 by default
   refreshHours: 6          # re-fetch board; dropouts stop new entries but can still close
+  minTrades: 0             # skip a row when the API exposes a trade count below this. 0 = off.
+                           # If the payload has no trade count, the filter is not applied (logged once).
+  autoDropNegativePnl: false  # optional: stop copying a trader after N of OUR closes are net-negative
+  autoDropMinCloses: 5     # minimum copied closes before auto-drop can fire
 
 # Manual list — only used when traderSource: manual
 # Prefer userId (stable). Handle can rename.
@@ -31,28 +35,53 @@ sizing:
   percentOfTrader: 10      # if mode=percent_of_trader: % of trader fill (needs tradeUsd)
   maxUsdPerTrade: 5        # hard cap per entry (keeps $2 mode bounded)
   minTraderTradeUsd: 50    # ignore trader fills smaller than this (when tradeUsd known)
+  mergeRebuys: true        # later buys from the same trader+token add to the open position
+                           # ignored when firstBuysOnly is true (that skip wins)
+  maxUsdPerToken: 5        # cumulative open cost basis per token across traders. 0 = no extra cap
 
 filters:
   marketCapMinUsd: 0
   marketCapMaxUsd: 0       # 0 = no max
-  firstBuysOnly: false     # if true, only copy the first buy of a new token position
-  allowedChains: [solana]       # must include a chain for it to trade; Base off by default
-  tokenSafety: block            # block | warn | off — Solana freeze authority / transfer hooks
+  firstBuysOnly: false     # if true, only the first buy of a token (no merge, no second position)
+  allowedChains: [solana]  # must include a chain for it to trade; Base off by default
+  tokenSafety: block       # block | warn | off — Solana mint checks below. block = fail closed
   blockFreezeAuthority: true
   blockTransferHooks: true
+  blockMintAuthority: true # block while the mint authority is still active
+  maxAlertAgeSec: 15       # skip buys older than this. 0 disables. Missing ts fails closed when > 0
+  maxTopHolderBps: 0       # 0 = off. Set e.g. 9000 to block when the largest account holds >90%.
+                           # Fail closed while enabled, including when RPC errors.
+                           # api.mainnet-beta.solana.com returns 429 for getTokenLargestAccounts,
+                           # so leave this at 0 unless your RPC actually serves that method.
+                           # AMM pools are often the largest holder — a tight cap blocks normal tokens.
+  roundTripMaxLossBps: 2500 # pre-buy sell quote of the tokens just quoted. Reject above this loss. 0 = off
+  minLiquidityUsd: 0       # optional DexScreener liquidity floor. 0 = off. When on, lookup failure blocks
 
 risk:
-  takeProfitPct: 50        # sell when mark is +50% from our entry (0 = disabled)
-  stopLossPct: 25          # sell when mark is -25% (0 = disabled)
-  maxSlippageBps: 300      # 3%
-  maxChaseBps: 500         # refuse if quote price moved >5% vs signal estimate
-  dailyBudgetUsd: 40       # ~20x $2 entries / day before stop
-  maxOpenPositions: 10
-  cooldownSeconds: 30      # min seconds between our entries
-  copySells: true          # mirror sells only for positions WE opened from that trader
+  takeProfitPct: 50        # TP1: mark +50% from our cost (0 = disabled)
+  takeProfitSellFraction: 0.5  # sell half at TP1; the rest uses the trailing stop
+  trailingStopPct: 20      # after TP1, exit the remainder if mark falls 20% from its peak (0 = off)
+  stopLossPct: 25          # full exit when mark is -25% from cost (0 = disabled). Still runs after TP1
+  maxHoldMinutes: 0        # optional full exit after this many minutes. 0 = off
+  maxSlippageBps: 300      # 3% buy slippage cap
+  sellSlippageBps: [300, 1000, 2500]  # sell retry ladder; first success wins
+  # maxChaseBps is the max gap between USD spent and the quote's USD out (price impact + fees).
+  # It is NOT "price moved vs the signal" — FOMO alerts do not include a token price.
+  maxChaseBps: 500
+  dailyBudgetUsd: 40       # ~20x $2 entries / day. Resets at 00:00 UTC
+  dailyLossLimitUsd: 20    # pause NEW entries when today's realized PnL <= -$20. Sells still run.
+                           # 0 = off. Resets at 00:00 UTC with daily_stats (not via the kill switch)
+  maxOpenPositions: 10     # written-off positions do not count
+  cooldownSeconds: 30      # per trader, not global
+  copySells: true          # mirror sells for positions WE opened from that trader (all of them)
   simulateBeforeSign: true # Solana: RPC simulateTransaction before any signature (fail closed)
-  simMaxExtraLamports: 50000  # ~0.00005 SOL fee/tolerance beyond expected input
-  simMaxExtraTokenOutflow: 0  # extra raw units allowed on input ATA outflow
+  simMaxExtraLamports: 50000       # slack on top of reported fees (~0.00005 SOL)
+  simMaxFeeLamports: 1000000       # fee budget when Jupiter omits signature/priority fields (~0.001 SOL)
+  simMaxOverheadLamports: 3000000  # hard ceiling on ATA rent + fees beyond the swap (~0.003 SOL)
+  simMaxExtraTokenOutflow: 0       # extra raw units allowed on input ATA outflow
+  closeEmptyTokenAccount: true     # after a full Solana exit, close the empty ATA and reclaim rent
+  quoteFailWriteoffCount: 5        # consecutive failed TP/SL quotes → written off
+  mirroredSellMaxRetries: 4        # failed trader-sell attempts before leaving the position to TP/SL
 
 quote:
   solanaNative: So11111111111111111111111111111111111111112   # wrap SOL
@@ -63,8 +92,12 @@ quote:
 
 poll:
   alertsRestEnabled: true
-  alertsRestIntervalSec: 20
-  tpSlCheckIntervalSec: 60
+  alertsRestOnlyWhenWsDown: true  # REST /v2/alerts costs 125 credits/call. Poll only while WS is down
+  alertsRestIntervalSec: 90       # fallback cadence (also used when alertsRestOnlyWhenWsDown is false)
+  tpSlCheckIntervalSec: 15
+  # One FOMO positions read per trader who still has an open position, per cycle (250 credits each).
+  # 3h keeps a top-3 book near ~6k credits/day. 0 disables.
+  positionReconcileIntervalSec: 10800
 
 logging:
   level: info              # debug | info | warn | error

@@ -31,6 +31,8 @@ describe("dry-run engine with fixtures", () => {
       },
     ];
     cfg.sizing.minTraderTradeUsd = 50;
+    // Fixtures are historical; the live max-age guard would skip every one of them.
+    cfg.filters.maxAlertAgeSec = 0;
     const env: EnvConfig = {
       fomoApiKey: "",
       dryRun: true,

@@ -81,6 +81,16 @@ export interface EvaluateSimOpts {
   otherAmountThreshold: bigint | null;
   /** Extra lamports beyond expected SOL input+fee that we tolerate. Default 50_000 (~0.00005 SOL). */
   maxExtraLamports: number;
+  /**
+   * Hard ceiling on rent + fees beyond the swap input. When > 0, a newly created
+   * output token account's lamports count as legitimate rent, and fees are allowed
+   * up to this ceiling. Real overspend above the ceiling is still rejected.
+   */
+  maxOverheadLamports?: number;
+  /** Fee budget when the order does not report signature/priority fees. */
+  maxFeeLamports?: number;
+  /** Jupiter-reported signature + priority fees. Null/undefined = not reported. */
+  reportedFeeLamports?: number | null;
   /** Extra token-raw units beyond expectedInAmount tolerated on input ATA. Default 0. */
   maxExtraTokenOutflow: bigint;
   pre: SimBalanceSnapshot;
@@ -90,6 +100,30 @@ export interface EvaluateSimOpts {
   watchedAddresses: string[];
   inputTokenAccount: string | null;
   outputTokenAccount: string | null;
+}
+
+/**
+ * SOL we will allow beyond the swap input.
+ * Rent observed in a newly created account counts, plus reported fees (or the
+ * fee budget when Jupiter omitted them) and a small slack. The sum is capped
+ * by maxOverheadLamports so a quote cannot authorize an arbitrary drain.
+ */
+export function extraLamportsAllowed(opts: {
+  observedRentLamports: bigint;
+  maxExtraLamports: number;
+  maxFeeLamports?: number;
+  maxOverheadLamports: number;
+  reportedFeeLamports?: number | null;
+}): bigint {
+  const slack = BigInt(Math.max(0, opts.maxExtraLamports));
+  const feeBudget =
+    opts.reportedFeeLamports != null && Number.isFinite(opts.reportedFeeLamports)
+      ? BigInt(Math.max(0, Math.floor(opts.reportedFeeLamports))) + slack
+      : BigInt(Math.max(0, opts.maxFeeLamports ?? opts.maxExtraLamports));
+  const rent = opts.observedRentLamports > 0n ? opts.observedRentLamports : 0n;
+  const raw = rent + feeBudget;
+  const cap = BigInt(Math.max(0, opts.maxOverheadLamports));
+  return raw > cap ? cap : raw;
 }
 
 /**
@@ -136,22 +170,34 @@ export function evaluateSimulatedBalances(opts: EvaluateSimOpts): SimValidateRes
     return { ok: false, error: "sim: wallet lamports missing from simulation accounts" };
   }
   const solDrop = BigInt(Math.max(0, preSol - postSol));
+  const observedRent = observedCreatedAccountRent(opts, postLamports);
+  const overheadOn = (opts.maxOverheadLamports ?? 0) > 0;
+  const allowedExtra = overheadOn
+    ? extraLamportsAllowed({
+        observedRentLamports: observedRent,
+        maxExtraLamports: opts.maxExtraLamports,
+        maxFeeLamports: opts.maxFeeLamports,
+        maxOverheadLamports: opts.maxOverheadLamports ?? 0,
+        reportedFeeLamports: opts.reportedFeeLamports,
+      })
+    : BigInt(opts.maxExtraLamports);
   if (isNativeIn) {
-    const maxDrop = opts.expectedInAmount + BigInt(opts.maxExtraLamports);
+    const maxDrop = opts.expectedInAmount + allowedExtra;
     if (solDrop > maxDrop) {
       return {
         ok: false,
-        error: `sim: SOL outflow ${solDrop} > expectedIn ${opts.expectedInAmount} + feeTol ${opts.maxExtraLamports}`,
+        error: overheadOn
+          ? `sim: SOL outflow ${solDrop} > expectedIn ${opts.expectedInAmount} + overhead ${allowedExtra} (rent=${observedRent}, ceiling=${opts.maxOverheadLamports})`
+          : `sim: SOL outflow ${solDrop} > expectedIn ${opts.expectedInAmount} + feeTol ${opts.maxExtraLamports}`,
       };
     }
-  } else {
-    // Fee-only SOL spend
-    if (solDrop > BigInt(opts.maxExtraLamports)) {
-      return {
-        ok: false,
-        error: `sim: unexpected SOL fee outflow ${solDrop} > maxExtraLamports ${opts.maxExtraLamports}`,
-      };
-    }
+  } else if (solDrop > allowedExtra) {
+    return {
+      ok: false,
+      error: overheadOn
+        ? `sim: unexpected SOL outflow ${solDrop} > overhead ${allowedExtra} (rent=${observedRent}, ceiling=${opts.maxOverheadLamports})`
+        : `sim: unexpected SOL fee outflow ${solDrop} > maxExtraLamports ${opts.maxExtraLamports}`,
+    };
   }
 
   // --- Input token ATA ---
@@ -217,8 +263,22 @@ export function evaluateSimulatedBalances(opts: EvaluateSimOpts): SimValidateRes
 
   return {
     ok: true,
-    detail: `sim ok solDrop=${solDrop} watched=${opts.watchedAddresses.length}`,
+    detail: `sim ok solDrop=${solDrop} rent=${observedRent} extraAllowed=${allowedExtra} watched=${opts.watchedAddresses.length}`,
   };
+}
+
+/** Lamports that appeared in an output account which did not exist (or was empty) before the sim. */
+export function observedCreatedAccountRent(
+  opts: Pick<EvaluateSimOpts, "pre" | "outputTokenAccount">,
+  postLamports: Map<string, number>,
+): bigint {
+  const addr = opts.outputTokenAccount;
+  if (!addr) return 0n;
+  const pre = opts.pre.lamports.get(addr);
+  const created = pre == null || pre === 0;
+  const post = postLamports.get(addr);
+  if (!created || post == null || post <= 0) return 0n;
+  return BigInt(post);
 }
 
 export interface SimulateSwapOpts {
@@ -230,6 +290,9 @@ export interface SimulateSwapOpts {
   expectedInAmount: string;
   otherAmountThreshold?: string | null;
   maxExtraLamports?: number;
+  maxOverheadLamports?: number;
+  maxFeeLamports?: number;
+  reportedFeeLamports?: number | null;
   maxExtraTokenOutflow?: bigint;
   /** Injected for tests */
   connection?: Connection;
@@ -251,6 +314,9 @@ export async function simulateAndValidateSwap(
 ): Promise<SimValidateResult> {
   const maxExtraLamports = opts.maxExtraLamports ?? 50_000;
   const maxExtraTokenOutflow = opts.maxExtraTokenOutflow ?? 0n;
+  const maxOverheadLamports = opts.maxOverheadLamports;
+  const maxFeeLamports = opts.maxFeeLamports;
+  const reportedFeeLamports = opts.reportedFeeLamports;
   let expectedIn: bigint;
   try {
     expectedIn = BigInt(opts.expectedInAmount);
@@ -444,6 +510,9 @@ export async function simulateAndValidateSwap(
     expectedInAmount: expectedIn,
     otherAmountThreshold: minOut,
     maxExtraLamports,
+    maxOverheadLamports,
+    maxFeeLamports,
+    reportedFeeLamports,
     maxExtraTokenOutflow,
     pre,
     postAccounts,

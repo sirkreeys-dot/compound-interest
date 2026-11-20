@@ -9,7 +9,16 @@ import type { EnvConfig } from "../config.js";
 import { validateJupiterOrder } from "../security/jupiterTx.js";
 import { redactSecrets } from "../security/redact.js";
 import { simulateAndValidateSwap } from "../security/simulateSwap.js";
-import { inspectSolanaMint, type TokenSafetyMode } from "../security/tokenSafety.js";
+import { roundTripRejection } from "../security/roundTrip.js";
+import {
+  evaluateLiquidity,
+  evaluateTopHolder,
+  fetchDexScreenerLiquidity,
+  fetchLargestHolderAmount,
+  inspectSolanaMint,
+  type TokenSafetyMode,
+} from "../security/tokenSafety.js";
+import { closeEmptyTokenAccount } from "./closeAta.js";
 import type { Store } from "../store/db.js";
 import type { AppConfig } from "../types.js";
 import { log } from "../utils/logger.js";
@@ -18,6 +27,34 @@ import type { PriceService } from "../utils/prices.js";
 import type { Executor, SwapRequest, SwapResult } from "./types.js";
 
 const JUP_BASE = "https://api.jup.ag/swap/v2";
+
+/** Start both promises before awaiting either. Safety never signs; /order never signs. */
+export function parallelSafetyAndOrder<A, B>(
+  safety: () => Promise<A>,
+  order: () => Promise<B>,
+): Promise<[A, B]> {
+  return Promise.all([safety(), order()]);
+}
+
+interface JupiterOrder {
+  transaction?: string | null;
+  requestId?: string;
+  outAmount?: string;
+  inAmount?: string;
+  inputMint?: string;
+  outputMint?: string;
+  outUsdValue?: number;
+  inUsdValue?: number;
+  slippageBps?: number;
+  taker?: string | null;
+  otherAmountThreshold?: string;
+  errorCode?: number;
+  errorMessage?: string;
+  router?: string;
+  signatureFeeLamports?: number;
+  prioritizationFeeLamports?: number;
+  rentFeeLamports?: number;
+}
 
 export class SolanaExecutor implements Executor {
   readonly chain = "solana" as const;
@@ -63,19 +100,22 @@ export class SolanaExecutor implements Executor {
     const sellToken = this.cfg.quote.preferStableBuys
       ? this.cfg.quote.solanaStable
       : this.cfg.quote.solanaNative;
-    const safety = await this.checkTokenSafety(req.buyToken);
-    if (safety?.blocked) {
-      return {
-        ok: false,
-        dryRun: req.dryRun,
-        error: `token_safety: ${safety.blockReason ?? "blocked"} (${safety.warnings.join("; ")})`,
-        pendingId: req.pendingId,
-      };
-    }
-    if (safety && safety.warnings.length) {
-      log.warn(`tokenSafety ${req.buyToken}: ${safety.warnings.join("; ")}`);
-    }
     return this.swap({ ...req, sellToken, buyToken: req.buyToken }, "buy");
+  }
+
+  /** Close the empty ATA for `mint` and reclaim rent. Live Solana only. */
+  async reclaimRent(mint: string): Promise<{ ok: boolean; rentLamports?: number; error?: string }> {
+    if (!this.keypair) return { ok: false, error: "no keypair" };
+    const result = await closeEmptyTokenAccount({
+      rpcUrl: this.rpcUrl,
+      owner: this.keypair,
+      mint,
+    });
+    return {
+      ok: result.ok,
+      rentLamports: result.rentLamports,
+      error: result.closed ? undefined : result.error,
+    };
   }
 
   async sellToken(req: SwapRequest): Promise<SwapResult> {
@@ -89,15 +129,181 @@ export class SolanaExecutor implements Executor {
     );
   }
 
+  private async requestOrder(opts: {
+    inputMint: string;
+    outputMint: string;
+    amount: string;
+    slippageBps: number;
+    taker: string | null;
+  }): Promise<{ ok: true; order: JupiterOrder } | { ok: false; error: string }> {
+    const params = new URLSearchParams({
+      inputMint: opts.inputMint,
+      outputMint: opts.outputMint,
+      amount: opts.amount,
+      slippageBps: String(opts.slippageBps),
+    });
+    if (opts.taker) params.set("taker", opts.taker);
+    const headers: Record<string, string> = {};
+    if (this.apiKey) headers["x-api-key"] = this.apiKey;
+    const orderRes = await fetch(`${JUP_BASE}/order?${params}`, { headers });
+    if (!orderRes.ok) {
+      const t = await orderRes.text();
+      return {
+        ok: false,
+        error: redactSecrets(`Jupiter /order ${orderRes.status}: ${t.slice(0, 200)}`),
+      };
+    }
+    const order = (await orderRes.json()) as JupiterOrder;
+    return { ok: true, order };
+  }
+
+  private reportedFees(order: JupiterOrder): number | null {
+    if (order.signatureFeeLamports == null && order.prioritizationFeeLamports == null) return null;
+    return (order.signatureFeeLamports ?? 0) + (order.prioritizationFeeLamports ?? 0);
+  }
+
+  /** Quoted rent + fees above the hard ceiling are rejected in dry-run and live. */
+  private quotedOverheadError(order: JupiterOrder): string | null {
+    const ceiling = this.cfg.risk.simMaxOverheadLamports ?? 0;
+    if (!(ceiling > 0)) return null;
+    const has =
+      order.rentFeeLamports != null ||
+      order.signatureFeeLamports != null ||
+      order.prioritizationFeeLamports != null;
+    if (!has) return null;
+    const total =
+      (order.rentFeeLamports ?? 0) +
+      (order.signatureFeeLamports ?? 0) +
+      (order.prioritizationFeeLamports ?? 0);
+    if (total > ceiling) {
+      return `overhead: quoted rent+fees ${total} lamports > simMaxOverheadLamports ${ceiling}`;
+    }
+    return null;
+  }
+
+  /**
+   * maxChaseBps is the max gap between USD spent and quote USD out
+   * (impact + fees). Alerts do not carry a token price, so this is not
+   * "price moved vs the signal".
+   */
+  private chaseError(sellUsd: number, outUsd: number | undefined): string | null {
+    if (!(this.cfg.risk.maxChaseBps > 0) || !(sellUsd > 0) || outUsd == null || !(outUsd > 0)) {
+      return null;
+    }
+    const lossBps = Math.round((1 - outUsd / sellUsd) * 10_000);
+    if (lossBps > this.cfg.risk.maxChaseBps) {
+      return `chase_limit: quote loss ${lossBps}bps > maxChaseBps ${this.cfg.risk.maxChaseBps}`;
+    }
+    return null;
+  }
+
+  private async roundTripError(
+    buyToken: string,
+    outAmount: string | undefined,
+    sellUsd: number,
+  ): Promise<string | null> {
+    const max = this.cfg.filters.roundTripMaxLossBps ?? 0;
+    if (!(max > 0)) return null;
+    if (!outAmount || outAmount === "0") {
+      return "round_trip: missing buy outAmount (fail closed)";
+    }
+    const quoted = await this.requestOrder({
+      inputMint: buyToken,
+      outputMint: this.cfg.quote.solanaNative,
+      amount: outAmount,
+      slippageBps: this.cfg.risk.maxSlippageBps,
+      taker: null,
+    });
+    if (!quoted.ok) return `round_trip: sell quote failed (fail closed): ${quoted.error}`;
+    let outUsd =
+      quoted.order.outUsdValue != null && quoted.order.outUsdValue > 0
+        ? quoted.order.outUsdValue
+        : null;
+    if (outUsd == null && quoted.order.outAmount) {
+      const valued = await this.prices.rawOutToUsd({
+        chain: "solana",
+        buyToken: this.cfg.quote.solanaNative,
+        outAmountRaw: quoted.order.outAmount,
+        quoteOutUsdValue: quoted.order.outUsdValue,
+      });
+      outUsd = valued?.usd ?? null;
+    }
+    return roundTripRejection(sellUsd, outUsd, max);
+  }
+
+  private feeFields(
+    order: JupiterOrder,
+    req: SwapRequest,
+    side: "buy" | "sell",
+  ): Pick<SwapResult, "inUsd" | "feeLamports" | "rentLamports" | "solInLamports" | "solOutLamports"> {
+    const fees = this.reportedFees(order);
+    const native = this.cfg.quote.solanaNative;
+    const solIn =
+      side === "buy" && req.sellToken === native ? (order.inAmount ?? undefined) : undefined;
+    const solOut =
+      side === "sell" && req.buyToken === native ? (order.outAmount ?? undefined) : undefined;
+    return {
+      inUsd: order.inUsdValue != null && order.inUsdValue > 0 ? order.inUsdValue : undefined,
+      feeLamports: fees ?? undefined,
+      rentLamports:
+        order.rentFeeLamports != null && order.rentFeeLamports > 0
+          ? order.rentFeeLamports
+          : undefined,
+      solInLamports: solIn,
+      solOutLamports: solOut,
+    };
+  }
+
   private async checkTokenSafety(mint: string) {
     const mode = (this.cfg.filters.tokenSafety ?? "block") as TokenSafetyMode;
     if (mode === "off") return null;
     if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) return null;
-    return inspectSolanaMint(this.rpcUrl, mint, {
+    const finding = await inspectSolanaMint(this.rpcUrl, mint, {
       mode,
       blockFreezeAuthority: this.cfg.filters.blockFreezeAuthority ?? true,
       blockTransferHooks: this.cfg.filters.blockTransferHooks ?? true,
+      blockMintAuthority: this.cfg.filters.blockMintAuthority ?? true,
     });
+    if (finding.blocked) return finding;
+
+    const maxBps = this.cfg.filters.maxTopHolderBps ?? 0;
+    if (maxBps > 0) {
+      const largest = await fetchLargestHolderAmount(this.rpcUrl, mint);
+      let supply: bigint | null = null;
+      if (finding.supply && /^\d+$/.test(finding.supply)) supply = BigInt(finding.supply);
+      const judged = evaluateTopHolder({
+        maxTopHolderBps: maxBps,
+        topAmount: largest.amount,
+        supply,
+        fetchFailed: largest.failed,
+      });
+      if (judged.blocked) {
+        finding.warnings.push(judged.detail);
+        if (mode === "block") {
+          finding.blocked = true;
+          finding.blockReason = "top_holder";
+          return finding;
+        }
+      }
+    }
+
+    const minLiq = this.cfg.filters.minLiquidityUsd ?? 0;
+    if (minLiq > 0) {
+      const liq = await fetchDexScreenerLiquidity(mint);
+      const judged = evaluateLiquidity({
+        minLiquidityUsd: minLiq,
+        liquidityUsd: liq.liquidityUsd,
+        fetchFailed: liq.fetchFailed,
+      });
+      if (judged.blocked) {
+        finding.warnings.push(judged.detail);
+        if (mode === "block") {
+          finding.blocked = true;
+          finding.blockReason = "low_liquidity";
+        }
+      }
+    }
+    return finding;
   }
 
   private async swap(req: SwapRequest, side: "buy" | "sell"): Promise<SwapResult> {
@@ -106,6 +312,8 @@ export class SolanaExecutor implements Executor {
       if (!req.dryRun && !this.keypair) {
         return { ok: false, dryRun: false, error: "LIVE mode requires SOLANA_PRIVATE_KEY", pendingId };
       }
+      const headers: Record<string, string> = {};
+      if (this.apiKey) headers["x-api-key"] = this.apiKey;
 
       let amount = req.sellAmountRaw;
       if (!amount) {
@@ -121,45 +329,33 @@ export class SolanaExecutor implements Executor {
         };
       }
 
-      const params = new URLSearchParams({
-        inputMint: req.sellToken,
-        outputMint: req.buyToken,
-        amount,
-        slippageBps: String(req.slippageBps),
-      });
-      if (this.keypair && !req.dryRun) {
-        params.set("taker", this.keypair.publicKey.toBase58());
-      }
-
-      const headers: Record<string, string> = {};
-      if (this.apiKey) headers["x-api-key"] = this.apiKey;
-
-      const orderRes = await fetch(`${JUP_BASE}/order?${params}`, { headers });
-      if (!orderRes.ok) {
-        const t = await orderRes.text();
+      const taker = this.keypair && !req.dryRun ? this.keypair.publicKey.toBase58() : null;
+      const [safety, ordered] = await parallelSafetyAndOrder(
+        () => (side === "buy" ? this.checkTokenSafety(req.buyToken) : Promise.resolve(null)),
+        () =>
+          this.requestOrder({
+            inputMint: req.sellToken,
+            outputMint: req.buyToken,
+            amount,
+            slippageBps: req.slippageBps,
+            taker,
+          }),
+      );
+      if (safety?.blocked) {
         return {
           ok: false,
           dryRun: req.dryRun,
-          error: redactSecrets(`Jupiter /order ${orderRes.status}: ${t.slice(0, 200)}`),
+          error: `token_safety: ${safety.blockReason ?? "blocked"} (${safety.warnings.join("; ")})`,
           pendingId,
         };
       }
-      const order = (await orderRes.json()) as {
-        transaction?: string | null;
-        requestId?: string;
-        outAmount?: string;
-        inAmount?: string;
-        inputMint?: string;
-        outputMint?: string;
-        outUsdValue?: number;
-        inUsdValue?: number;
-        slippageBps?: number;
-        taker?: string | null;
-        otherAmountThreshold?: string;
-        errorCode?: number;
-        errorMessage?: string;
-        router?: string;
-      };
+      if (safety && safety.warnings.length) {
+        log.warn(`tokenSafety ${req.buyToken}: ${safety.warnings.join("; ")}`);
+      }
+      if (!ordered.ok) {
+        return { ok: false, dryRun: req.dryRun, error: ordered.error, pendingId };
+      }
+      const order = ordered.order;
 
       const summary = `jupiter router=${order.router ?? "?"} in=${order.inAmount ?? amount} out=${order.outAmount ?? "?"}`;
       const outUsd =
@@ -176,26 +372,52 @@ export class SolanaExecutor implements Executor {
         )?.usd ??
         undefined;
 
+      const overheadError = this.quotedOverheadError(order);
+      if (overheadError) {
+        return {
+          ok: false,
+          dryRun: req.dryRun,
+          error: overheadError,
+          quoteSummary: summary,
+          outUsd,
+          outAmountRaw: order.outAmount,
+          inAmountRaw: order.inAmount ?? amount,
+          pendingId,
+          ...this.feeFields(order, req, side),
+        };
+      }
+
+      if (side === "buy") {
+        const roundTripError = await this.roundTripError(req.buyToken, order.outAmount, req.sellUsd);
+        if (roundTripError) {
+          return {
+            ok: false,
+            dryRun: req.dryRun,
+            error: roundTripError,
+            quoteSummary: summary,
+            outUsd,
+            outAmountRaw: order.outAmount,
+            inAmountRaw: order.inAmount ?? amount,
+            pendingId,
+            ...this.feeFields(order, req, side),
+          };
+        }
+      }
+
+      const chaseError = this.chaseError(req.sellUsd, outUsd);
       if (req.dryRun) {
-        if (
-          this.cfg.risk.maxChaseBps > 0 &&
-          req.sellUsd > 0 &&
-          outUsd != null &&
-          outUsd > 0
-        ) {
-          const lossBps = Math.round((1 - outUsd / req.sellUsd) * 10_000);
-          if (lossBps > this.cfg.risk.maxChaseBps) {
-            return {
-              ok: false,
-              dryRun: true,
-              error: `chase_limit: quote loss ${lossBps}bps > maxChaseBps ${this.cfg.risk.maxChaseBps}`,
-              quoteSummary: summary,
-              outUsd,
-              outAmountRaw: order.outAmount,
-              inAmountRaw: order.inAmount ?? amount,
-              pendingId,
-            };
-          }
+        if (chaseError) {
+          return {
+            ok: false,
+            dryRun: true,
+            error: chaseError,
+            quoteSummary: summary,
+            outUsd,
+            outAmountRaw: order.outAmount,
+            inAmountRaw: order.inAmount ?? amount,
+            pendingId,
+            ...this.feeFields(order, req, side),
+          };
         }
         return {
           ok: true,
@@ -205,6 +427,7 @@ export class SolanaExecutor implements Executor {
           outUsd,
           quoteSummary: summary,
           pendingId,
+          ...this.feeFields(order, req, side),
         };
       }
 
@@ -254,6 +477,9 @@ export class SolanaExecutor implements Executor {
           expectedInAmount: order.inAmount ?? amount,
           otherAmountThreshold: order.otherAmountThreshold ?? null,
           maxExtraLamports: this.cfg.risk.simMaxExtraLamports ?? 50_000,
+          maxFeeLamports: this.cfg.risk.simMaxFeeLamports ?? 1_000_000,
+          maxOverheadLamports: this.cfg.risk.simMaxOverheadLamports ?? 3_000_000,
+          reportedFeeLamports: this.reportedFees(order),
           maxExtraTokenOutflow: BigInt(this.cfg.risk.simMaxExtraTokenOutflow ?? 0),
         });
         if (!sim.ok) {
@@ -366,6 +592,7 @@ export class SolanaExecutor implements Executor {
         outUsd: liveOut,
         quoteSummary: summary,
         pendingId,
+        ...this.feeFields(order, req, side),
       };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

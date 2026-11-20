@@ -29,6 +29,10 @@ export class FomoAlertSocket {
     return this.trader;
   }
 
+  isOpen(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+
   start(): void {
     this.stopped = false;
     this.connect();
@@ -195,5 +199,14 @@ export class FomoAlertFanout {
 
   currentTraders(): string[] {
     return [...this.sockets.keys()];
+  }
+
+  /** True when at least one alert socket is open. REST polling uses this as its fallback gate. */
+  isHealthy(): boolean {
+    if (!this.started || this.sockets.size === 0) return false;
+    for (const sock of this.sockets.values()) {
+      if (sock.isOpen()) return true;
+    }
+    return false;
   }
 }

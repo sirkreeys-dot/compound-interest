@@ -135,6 +135,33 @@ export async function resolveSellFraction(opts: {
   };
 }
 
+/**
+ * Whether the trader still holds `tokenAddress` according to a FOMO positions body.
+ * `unknown` means the payload could not be trusted — callers must not flatten on it.
+ * A token missing from a parsed positions array is `flat` (the same assumption the
+ * sell-fraction path already uses).
+ */
+export function traderHoldState(
+  body: unknown,
+  tokenAddress: string,
+): "open" | "flat" | "unknown" {
+  if (!body || typeof body !== "object") return "unknown";
+  const b = body as { available?: boolean; positions?: PosRow[]; trades?: PosRow[] };
+  if (b.available === false) return "unknown";
+  const rows = Array.isArray(b.positions)
+    ? b.positions
+    : Array.isArray(b.trades)
+      ? b.trades
+      : null;
+  if (!rows) return "unknown";
+  const addr = tokenAddress.toLowerCase();
+  const row = rows.find((r) => r.token?.address && r.token.address.toLowerCase() === addr);
+  if (!row) return "flat";
+  if (row.status === "closed") return "flat";
+  if (typeof row.amount === "number" && row.amount <= 0) return "flat";
+  return "open";
+}
+
 /** Parse trader token amount from a FOMO positions response for one mint. */
 export function findTraderTokenAmount(
   body: unknown,

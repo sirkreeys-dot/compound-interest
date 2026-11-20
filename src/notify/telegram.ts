@@ -20,6 +20,10 @@ export interface TelegramDeps {
   dryRun: boolean;
   getWsStatus: () => string;
   getWatchlistSummary?: () => string;
+  /** Authorized /close. Returns a user-facing summary. */
+  onCloseToken?: (query: string) => Promise<string>;
+  /** Authorized /writeoff. Returns a user-facing summary. */
+  onWriteoffToken?: (query: string) => Promise<string>;
 }
 
 export class TelegramNotifier {
@@ -60,7 +64,7 @@ export class TelegramNotifier {
     };
     void tick();
     this.pollTimer = setInterval(() => void tick(), 2500);
-    log.info("Telegram command polling started (/status /positions /pause /resume)");
+    log.info("Telegram command polling started (/status /positions /stats /pause /resume /close /writeoff)");
   }
 
   stop(): void {
@@ -264,11 +268,14 @@ export class TelegramNotifier {
           continue;
         }
       }
-      await this.handleCommand(text.split(/\s+/)[0]!.split("@")[0]!);
+      const parts = text.split(/\s+/);
+      const cmd = parts[0]!.split("@")[0]!;
+      const arg = parts.slice(1).join(" ").trim();
+      await this.handleCommand(cmd, arg);
     }
   }
 
-  private async handleCommand(cmd: string): Promise<void> {
+  private async handleCommand(cmd: string, arg = ""): Promise<void> {
     const d = this.deps;
     if (!d) {
       await this.send("Bot internals not attached yet.");
@@ -281,8 +288,11 @@ export class TelegramNotifier {
             "<b>Commands</b> (this chat only)",
             "/status — mode, pause, positions, daily spend, WS",
             "/positions — open positions",
+            "/stats — per-trader win rate and realized PnL",
             "/pause — kill switch ON (block new entries)",
             "/resume — kill switch OFF",
+            "/close &lt;token&gt; — sell that open position now",
+            "/writeoff &lt;token&gt; — drop a position without selling",
             "/help — this message",
           ].join("\n"),
         );
@@ -303,7 +313,10 @@ export class TelegramNotifier {
             `Size: $${d.cfg.sizing.fixedUsd} fixed (max $${d.cfg.sizing.maxUsdPerTrade})`,
             `Open positions: ${open.length} / ${d.cfg.risk.maxOpenPositions}`,
             `Today spent: $${daily.spentUsd.toFixed(2)} / $${d.cfg.risk.dailyBudgetUsd}`,
-            `Today realized PnL: $${daily.realizedPnlUsd.toFixed(2)}`,
+            `Today realized PnL: $${(d.dryRun ? daily.paperRealizedPnlUsd : daily.realizedPnlUsd).toFixed(2)}` +
+              (d.cfg.risk.dailyLossLimitUsd > 0
+                ? ` (loss limit $${d.cfg.risk.dailyLossLimitUsd}, resets 00:00 UTC)`
+                : " (resets 00:00 UTC)"),
             `Today trades: ${daily.trades}`,
             `Watching: ${esc(watching)}`,
           ].join("\n"),
@@ -331,6 +344,55 @@ export class TelegramNotifier {
         d.kill.resume();
         await this.send("▶️ Kill switch OFF — entries allowed again.");
         break;
+      case "/stats": {
+        const rows = d.store.listTraderStats(d.dryRun);
+        if (!rows.length) {
+          await this.send(
+            d.dryRun
+              ? "No closed paper trades yet."
+              : "No closed live trades yet.",
+          );
+          break;
+        }
+        const lines = rows.map((r) => {
+          const name = r.traderHandle ?? r.traderUserId ?? "?";
+          const rate = r.closes > 0 ? Math.round((r.wins / r.closes) * 100) : 0;
+          return `${esc(name)}: ${r.wins}/${r.closes} wins (${rate}%) PnL ${r.realizedPnlUsd >= 0 ? "+" : ""}$${r.realizedPnlUsd.toFixed(2)}`;
+        });
+        const total = rows.reduce((s, r) => s + r.realizedPnlUsd, 0);
+        await this.send(
+          [`<b>Stats ${d.dryRun ? "(paper)" : "(live)"}</b>`, ...lines, `Total realized: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}`].join(
+            "\n",
+          ),
+        );
+        break;
+      }
+      case "/close": {
+        if (!arg) {
+          await this.send("Usage: /close &lt;symbol or mint&gt;");
+          break;
+        }
+        if (!d.onCloseToken) {
+          await this.send("Close is not wired.");
+          break;
+        }
+        const msg = await d.onCloseToken(arg);
+        await this.send(esc(msg));
+        break;
+      }
+      case "/writeoff": {
+        if (!arg) {
+          await this.send("Usage: /writeoff &lt;symbol or mint&gt;");
+          break;
+        }
+        if (!d.onWriteoffToken) {
+          await this.send("Writeoff is not wired.");
+          break;
+        }
+        const msg = await d.onWriteoffToken(arg);
+        await this.send(esc(msg));
+        break;
+      }
       default:
         await this.send(`Unknown command ${esc(cmd)}. Try /help`);
     }

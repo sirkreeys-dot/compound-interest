@@ -20,7 +20,15 @@ import {
   nativeBalanceFromTrace,
 } from "../src/security/baseChecks.js";
 import { evaluateFakeLiquidity, evaluateQuoteDepth, jupiterImpactBps } from "../src/security/fakeLiquidity.js";
-import { classifySellSimulation, combineBuyAndSellForSim } from "../src/security/sellSim.js";
+import {
+  classifySellSimulation,
+  combineBuyAndSellForSim,
+  compileRoundTripForSim,
+  instructionsFromSwapBody,
+  roundTripSellAmount,
+  SIM_TX_SIZE_LIMIT,
+} from "../src/security/sellSim.js";
+import { inspectSwapInstructions } from "../src/security/programAllowlist.js";
 import { inspectSolanaMint } from "../src/security/tokenSafety.js";
 import { reconcilePendingSwaps } from "../src/store/reconcilePending.js";
 import { Store } from "../src/store/db.js";
@@ -221,6 +229,50 @@ describe("H6 trap tokens", () => {
     });
     assert.equal(combined.message.compiledInstructions.length, 2);
     assert.equal(combined.message.staticAccountKeys[0]!.equals(payer.publicKey), true);
+  });
+
+  it("compiles buy-then-sell instructions under the size limit and the allowlist", () => {
+    assert.equal(roundTripSellAmount("100", "90"), "90");
+    assert.equal(roundTripSellAmount("100", null), "100");
+    assert.equal(roundTripSellAmount(undefined, "0"), null);
+    const payer = Keypair.generate();
+    const dest = Keypair.generate().publicKey;
+    const leg = (lamports: number) =>
+      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: dest, lamports });
+    const { tx, bytes } = compileRoundTripForSim({
+      buyIxs: [leg(1)],
+      sellIxs: [leg(2)],
+      payer: payer.publicKey,
+      recentBlockhash: Keypair.generate().publicKey.toBase58(),
+    });
+    assert.ok(bytes <= SIM_TX_SIZE_LIMIT);
+    assert.equal(tx.message.compiledInstructions.length, 3);
+    assert.equal(tx.message.header.numRequiredSignatures, 1);
+    const keys = tx.message.staticAccountKeys;
+    const allow = loadAppConfig(path.join(root, "config.example.yaml")).risk.solanaProgramAllowlist;
+    const inspected = inspectSwapInstructions({
+      tx,
+      accountKeys: keys,
+      ourPubkey: payer.publicKey,
+      allowlist: allow,
+    });
+    assert.equal(inspected.ok, true);
+    const body = instructionsFromSwapBody({
+      setupInstructions: [
+        {
+          programId: SystemProgram.programId.toBase58(),
+          accounts: [
+            { pubkey: payer.publicKey.toBase58(), isSigner: true, isWritable: true },
+            { pubkey: dest.toBase58(), isSigner: false, isWritable: true },
+          ],
+          data: Buffer.from(leg(3).data).toString("base64"),
+        },
+      ],
+      swapInstruction: null,
+      cleanupInstruction: null,
+    });
+    assert.equal(body.length, 1);
+    assert.equal(body[0]!.programId.equals(SystemProgram.programId), true);
   });
 
   it("blocks young pools, empty quote reserves, deep-pool impact, hooks, and high fees", async () => {

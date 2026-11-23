@@ -84,7 +84,7 @@ risk:
   simulateBeforeSign: true # Solana: RPC simulateTransaction before any signature (fail closed)
   simMaxExtraLamports: 50000       # slack on top of reported fees (~0.00005 SOL)
   simMaxFeeLamports: 1000000       # fee budget when Jupiter omits signature/priority fields (~0.001 SOL)
-  simMaxOverheadLamports: 3000000  # hard ceiling on ATA rent + fees beyond the swap (~0.003 SOL)
+  simMaxOverheadLamports: 5000000  # hard ceiling on ATA rent + fees beyond the swap (0.005 SOL)
   simMaxExtraTokenOutflow: 0       # extra raw units allowed on input ATA outflow
   closeEmptyTokenAccount: true     # after a full Solana exit, close the empty ATA and reclaim rent
   quoteFailWriteoffCount: 5        # consecutive failed TP/SL quotes → written off

@@ -154,7 +154,7 @@ export interface AppConfig {
     simMaxFeeLamports: number;
     /**
      * Hard ceiling on SOL spent beyond the swap input (ATA rent + signature + priority).
-     * Default 3000000 (~0.003 SOL). Real overspend above this is rejected.
+     * Default 5000000 (0.005 SOL). Real overspend above this is rejected.
      */
     simMaxOverheadLamports: number;
     /** Extra raw token units tolerated on input ATA outflow. Default 0. */

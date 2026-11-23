@@ -98,7 +98,7 @@ const configSchema = z.object({
     simulateBeforeSign: z.boolean().default(true),
     simMaxExtraLamports: z.number().int().nonnegative().default(50_000),
     simMaxFeeLamports: z.number().int().nonnegative().default(1_000_000),
-    simMaxOverheadLamports: z.number().int().nonnegative().default(3_000_000),
+    simMaxOverheadLamports: z.number().int().nonnegative().default(5_000_000),
     simMaxExtraTokenOutflow: z.number().int().nonnegative().default(0),
     closeEmptyTokenAccount: z.boolean().default(true),
     quoteFailWriteoffCount: z.number().int().positive().default(5),

@@ -12,7 +12,13 @@ import {
   inspectSwapInstructions,
 } from "../security/programAllowlist.js";
 import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, rpcConnection } from "../utils/http.js";
-import { classifySellSimulation, combineBuyAndSellForSim } from "../security/sellSim.js";
+import {
+  classifySellSimulation,
+  compileRoundTripForSim,
+  instructionsFromSwapBody,
+  roundTripSellAmount,
+  type SwapInstructionsBody,
+} from "../security/sellSim.js";
 import { evaluateFakeLiquidity, evaluateQuoteDepth, jupiterImpactBps, bestSolanaPair } from "../security/fakeLiquidity.js";
 import { redactSecrets } from "../security/redact.js";
 import { simulateAndValidateSwap } from "../security/simulateSwap.js";
@@ -34,6 +40,7 @@ import type { PriceService } from "../utils/prices.js";
 import type { Executor, SwapRequest, SwapResult } from "./types.js";
 
 const JUP_BASE = "https://api.jup.ag/swap/v2";
+const JUP_IX = "https://api.jup.ag/swap/v1";
 
 /** Start both promises before awaiting either. Safety never signs; /order never signs. */
 /** Reject a buy unless Jupiter reported an input USD value inside the cap plus a small tolerance. */
@@ -230,22 +237,25 @@ export class SolanaExecutor implements Executor {
   private async roundTripError(
     buyToken: string,
     outAmount: string | undefined,
+    minOutAmount: string | null,
+    buyAmountRaw: string,
     sellUsd: number,
     live: boolean,
-    buyTxB64: string | null,
   ): Promise<string | null> {
     const max = this.cfg.filters.roundTripMaxLossBps ?? 0;
     if (!(max > 0)) return null;
-    if (!outAmount || outAmount === "0") {
+    const sellAmount = roundTripSellAmount(outAmount, minOutAmount);
+    if (!sellAmount) {
       return "round_trip: missing buy outAmount (fail closed)";
     }
-    const taker = this.simulationTaker();
+    // No taker: /order refuses a sell transaction, and sometimes the quote, when the
+    // wallet does not already hold the token. The USD check does not need a taker.
     const quoted = await this.requestOrder({
       inputMint: buyToken,
       outputMint: this.cfg.quote.solanaNative,
-      amount: outAmount,
+      amount: sellAmount,
       slippageBps: this.cfg.risk.maxSlippageBps,
-      taker,
+      taker: null,
     });
     if (!quoted.ok) return `round_trip: sell quote failed (fail closed): ${quoted.error}`;
     let outUsd =
@@ -268,6 +278,7 @@ export class SolanaExecutor implements Executor {
       jupiterImpactBps((quoted.order as { priceImpactPct?: number | string }).priceImpactPct),
     );
     if (depth) return depth;
+    const taker = this.simulationTaker();
     if (!taker) {
       log.warn(
         "dryRunSellSim=no_public_key: set DRY_RUN_SOLANA_PUBKEY (a public address, not a secret) to simulate the sell without a private key. The quote is not treated as proof the token can be sold.",
@@ -275,14 +286,18 @@ export class SolanaExecutor implements Executor {
       if (live) return "round_trip: no wallet public key to simulate the sell (fail closed)";
       return null;
     }
-    if (!quoted.order.transaction) {
-      log.warn(
-        "dryRunSellSim=no_sell_tx: Jupiter did not return a sell transaction for this public taker.",
-      );
-      if (live) return "round_trip: sell order had no transaction to simulate (fail closed)";
+    const built = await this.buildInstructionRoundTrip({
+      buyMint: buyToken,
+      buyAmountRaw,
+      sellAmountRaw: sellAmount,
+      taker,
+    });
+    if (!built.ok) {
+      log.warn(`dryRunSellSim=${built.code}: ${built.error}`);
+      if (live) return `round_trip: ${built.error} (fail closed)`;
       return null;
     }
-    return this.simulateRoundTripTx(quoted.order.transaction, buyTxB64, taker, live);
+    return this.simulateCompiledRoundTrip(built.tx, taker, live);
   }
 
   private async quoteDepthError(mint: string, sellImpactBps: number | null): Promise<string | null> {
@@ -313,58 +328,133 @@ export class SolanaExecutor implements Executor {
   }
 
   /**
-   * Simulate buy-then-sell as one transaction. Never signs or broadcasts.
-   * sigVerify is false, so a private key is not required. The buy runs first
-   * inside the simulation so the sell can see tokens a fresh wallet does not hold.
-   * If the bundle cannot be built, dry-run logs dryRunSellSim=bundle_unavailable
-   * and does not treat the quote as proof of a sell. Live mode fails closed.
+   * Buy and sell instructions from Jupiter /swap/v1/swap-instructions.
+   * That endpoint builds instructions for a public key without checking that the
+   * wallet already holds the input token. /order will not return a sell transaction
+   * in that case. The sell amount is the buy's minimum out. Nothing is signed.
    */
-  private async simulateRoundTripTx(
-    sellB64: string,
-    buyB64: string | null,
+  private async buildInstructionRoundTrip(opts: {
+    buyMint: string;
+    buyAmountRaw: string;
+    sellAmountRaw: string;
+    taker: string;
+  }): Promise<{ ok: true; tx: VersionedTransaction } | { ok: false; code: string; error: string }> {
+    const native = this.cfg.quote.solanaNative;
+    const buyQuote = await this.swapQuoteV1(native, opts.buyMint, opts.buyAmountRaw);
+    if (!buyQuote.ok) return { ok: false, code: "no_buy_quote", error: buyQuote.error };
+    const sellQuote = await this.swapQuoteV1(opts.buyMint, native, opts.sellAmountRaw);
+    if (!sellQuote.ok) return { ok: false, code: "no_sell_quote", error: sellQuote.error };
+    const buyIxs = await this.swapInstructions(buyQuote.quote, opts.taker);
+    if (!buyIxs.ok) return { ok: false, code: "no_sell_instructions", error: buyIxs.error };
+    const sellIxs = await this.swapInstructions(sellQuote.quote, opts.taker);
+    if (!sellIxs.ok) return { ok: false, code: "no_sell_instructions", error: sellIxs.error };
+    const tables = await this.loadAltAddresses([
+      ...(buyIxs.body.addressLookupTableAddresses ?? []),
+      ...(sellIxs.body.addressLookupTableAddresses ?? []),
+    ]);
+    if (!tables.ok) return { ok: false, code: "bundle_unavailable", error: tables.error };
+    try {
+      const { tx } = compileRoundTripForSim({
+        buyIxs: instructionsFromSwapBody(buyIxs.body),
+        sellIxs: instructionsFromSwapBody(sellIxs.body),
+        payer: new PublicKey(opts.taker),
+        lookupTables: tables.tables,
+        recentBlockhash: new PublicKey(opts.taker).toBase58(),
+      });
+      return { ok: true, tx };
+    } catch (e) {
+      return {
+        ok: false,
+        code: "bundle_unavailable",
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+
+  private async swapQuoteV1(
+    inputMint: string,
+    outputMint: string,
+    amount: string,
+  ): Promise<{ ok: true; quote: unknown } | { ok: false; error: string }> {
+    const params = new URLSearchParams({
+      inputMint,
+      outputMint,
+      amount,
+      slippageBps: String(this.cfg.risk.maxSlippageBps),
+    });
+    try {
+      const res = await fetchRetry(`${JUP_IX}/quote?${params}`, {}, { timeoutMs: QUOTE_TIMEOUT_MS, retries: 2 });
+      if (!res.ok) {
+        const t = await res.text();
+        return { ok: false, error: redactSecrets(`Jupiter quote ${res.status}: ${t.slice(0, 180)}`) };
+      }
+      return { ok: true, quote: await res.json() };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  private async swapInstructions(
+    quote: unknown,
+    userPublicKey: string,
+  ): Promise<{ ok: true; body: SwapInstructionsBody } | { ok: false; error: string }> {
+    try {
+      const res = await fetchRetry(
+        `${JUP_IX}/swap-instructions`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json", ...(this.apiKey ? { "x-api-key": this.apiKey } : {}) },
+          body: JSON.stringify({
+            quoteResponse: quote,
+            userPublicKey,
+            wrapAndUnwrapSol: true,
+            dynamicComputeUnitLimit: true,
+          }),
+        },
+        { timeoutMs: QUOTE_TIMEOUT_MS, retries: 2 },
+      );
+      if (!res.ok) {
+        const t = await res.text();
+        return { ok: false, error: redactSecrets(`Jupiter swap-instructions ${res.status}: ${t.slice(0, 180)}`) };
+      }
+      return { ok: true, body: (await res.json()) as SwapInstructionsBody };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  private async loadAltAddresses(
+    addresses: string[],
+  ): Promise<
+    { ok: true; tables: import("@solana/web3.js").AddressLookupTableAccount[] } | { ok: false; error: string }
+  > {
+    const unique = [...new Set(addresses)];
+    if (!unique.length) return { ok: true, tables: [] };
+    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+      return { ok: false, error: "cannot load address lookup tables" };
+    }
+    try {
+      const conn = rpcConnection(this.rpcUrl);
+      const tables = [];
+      for (const addr of unique) {
+        const got = await conn.getAddressLookupTable(new PublicKey(addr));
+        if (!got.value) return { ok: false, error: `lookup table ${addr} missing` };
+        tables.push(got.value);
+      }
+      return { ok: true, tables };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  /** Simulate the combined buy-then-sell. Never signs or broadcasts. */
+  private async simulateCompiledRoundTrip(
+    tx: VersionedTransaction,
     taker: string,
     live: boolean,
   ): Promise<string | null> {
-    let sellTx: VersionedTransaction;
-    try {
-      sellTx = VersionedTransaction.deserialize(Buffer.from(sellB64, "base64"));
-    } catch {
-      return "round_trip: sell transaction did not deserialize (fail closed)";
-    }
     const payer = new PublicKey(taker);
-    let simTx = sellTx;
-    let bundled = false;
-    if (buyB64) {
-      try {
-        const buyTx = VersionedTransaction.deserialize(Buffer.from(buyB64, "base64"));
-        const tables = await this.loadLookupTables(buyTx, sellTx);
-        if (tables) {
-          const buyKeys = accountKeysFromLoadedMessage(buyTx, tables.buy);
-          const sellKeys = accountKeysFromLoadedMessage(sellTx, tables.sell);
-          if (buyKeys && sellKeys) {
-            simTx = combineBuyAndSellForSim({
-              buy: buyTx,
-              sell: sellTx,
-              buyKeys,
-              sellKeys,
-              payer,
-              lookupTables: [...tables.buy, ...tables.sell],
-            });
-            bundled = true;
-          }
-        }
-      } catch (e) {
-        log.warn("dryRunSellSim=bundle_unavailable", e);
-      }
-    }
-    if (!bundled) {
-      log.warn(
-        "dryRunSellSim=bundle_unavailable: could not simulate the buy and sell as one transaction (lookup tables or a missing buy tx). A sell of tokens this wallet does not hold yet cannot be distinguished from a honeypot. The quote is not treated as proof of a sell.",
-      );
-      if (live) return "round_trip: cannot build buy+sell simulation (fail closed)";
-      return null;
-    }
-    const guarded = await this.guardSwapTx(simTx, payer);
+    const guarded = await this.guardSwapTx(tx, payer);
     if (!guarded.ok) return `round_trip: ${guarded.error}`;
     if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
       if (live) return "round_trip: cannot simulate sell on loopback RPC (fail closed)";
@@ -373,7 +463,7 @@ export class SolanaExecutor implements Executor {
     }
     try {
       const conn = rpcConnection(this.rpcUrl);
-      const sim = await conn.simulateTransaction(simTx, {
+      const sim = await conn.simulateTransaction(tx, {
         sigVerify: false,
         replaceRecentBlockhash: true,
       });
@@ -587,9 +677,10 @@ export class SolanaExecutor implements Executor {
         const roundTripError = await this.roundTripError(
           req.buyToken,
           order.outAmount,
+          order.otherAmountThreshold ?? null,
+          order.inAmount ?? amount,
           req.sellUsd,
           !req.dryRun,
-          order.transaction ?? null,
         );
         if (roundTripError) {
           return {
@@ -705,7 +796,7 @@ export class SolanaExecutor implements Executor {
           otherAmountThreshold: order.otherAmountThreshold ?? null,
           maxExtraLamports: this.cfg.risk.simMaxExtraLamports ?? 50_000,
           maxFeeLamports: this.cfg.risk.simMaxFeeLamports ?? 1_000_000,
-          maxOverheadLamports: this.cfg.risk.simMaxOverheadLamports ?? 3_000_000,
+          maxOverheadLamports: this.cfg.risk.simMaxOverheadLamports ?? 5_000_000,
           reportedFeeLamports: this.reportedFees(order),
           maxExtraTokenOutflow: BigInt(this.cfg.risk.simMaxExtraTokenOutflow ?? 0),
           extraAccountKeys: guarded.accountKeys,
@@ -931,27 +1022,6 @@ export class SolanaExecutor implements Executor {
         pendingId,
       };
     }
-  }
-
-  private async loadLookupTables(
-    buy: VersionedTransaction,
-    sell: VersionedTransaction,
-  ): Promise<{ buy: import("@solana/web3.js").AddressLookupTableAccount[]; sell: import("@solana/web3.js").AddressLookupTableAccount[] } | null> {
-    const need = [...(buy.message.addressTableLookups ?? []), ...(sell.message.addressTableLookups ?? [])];
-    if (!need.length) return { buy: [], sell: [] };
-    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) return null;
-    const conn = rpcConnection(this.rpcUrl);
-    const loaded = new Map<string, import("@solana/web3.js").AddressLookupTableAccount>();
-    for (const lookup of need) {
-      const key = lookup.accountKey.toBase58();
-      if (loaded.has(key)) continue;
-      const got = await conn.getAddressLookupTable(lookup.accountKey);
-      if (!got.value) return null;
-      loaded.set(key, got.value);
-    }
-    const pick = (tx: VersionedTransaction) =>
-      (tx.message.addressTableLookups ?? []).map((l) => loaded.get(l.accountKey.toBase58())!);
-    return { buy: pick(buy), sell: pick(sell) };
   }
 
   private async guardSwapTx(

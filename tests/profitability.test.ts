@@ -1144,7 +1144,7 @@ describe("reconcile, pnl, daily loss, rest polling, close-account ix", () => {
     assert.equal("maxAlertAgeSec" in cfg.filters, false);
     assert.equal("takeProfitPct" in cfg.risk, false);
     assert.equal("takeProfitSellFraction" in cfg.risk, false);
-    assert.equal(cfg.risk.simMaxOverheadLamports, 3_000_000);
+    assert.equal(cfg.risk.simMaxOverheadLamports, 5_000_000);
     assert.equal(cfg.risk.stopLossPct, 25);
     assert.equal(cfg.risk.trailingStopPct, 20);
     assert.equal(cfg.risk.dailyLossLimitUsd, 20);

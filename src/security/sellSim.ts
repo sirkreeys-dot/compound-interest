@@ -15,6 +15,38 @@ import {
 
 export type SellSimClass = "ok" | "no_balance" | "honeypot";
 
+/** passed: simulation succeeded. skipped: could not run (not a pass). failed: ran and refused. */
+export type SellSimOutcome = "passed" | "skipped" | "failed";
+
+export type SellSimReason =
+  | "simulated"
+  | "no_public_key"
+  | "no_rpc"
+  | "no_balance"
+  | "no_route"
+  | "honeypot"
+  | "high_tax"
+  | "sim_error"
+  | "timeout"
+  | "allowlist";
+
+const SKIP_REASONS = new Set<SellSimReason>(["no_public_key", "no_rpc", "no_balance"]);
+
+export function sellSimVerdict(
+  reason: SellSimReason,
+  live: boolean,
+): { outcome: SellSimOutcome; refuseBuy: boolean } {
+  if (reason === "simulated") return { outcome: "passed", refuseBuy: false };
+  if (SKIP_REASONS.has(reason)) return { outcome: "skipped", refuseBuy: live };
+  return { outcome: "failed", refuseBuy: true };
+}
+
+/** One line per outcome. "skipped" is never the same wording as "passed". */
+export function sellSimLogLine(reason: SellSimReason, live: boolean, detail: string): string {
+  const { outcome } = sellSimVerdict(reason, live);
+  return `sell_sim outcome=${outcome} reason=${reason} mode=${live ? "live" : "dry_run"} detail=${detail}`;
+}
+
 /** Serialized v0 transactions must stay within this many bytes. */
 export const SIM_TX_SIZE_LIMIT = 1232;
 

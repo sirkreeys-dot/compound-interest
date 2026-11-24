@@ -3,6 +3,7 @@ import path from "node:path";
 import dotenv from "dotenv";
 import yaml from "js-yaml";
 import { z } from "zod";
+import { OVERHEAD_HARD_CAP_LAMPORTS } from "./security/overhead.js";
 import { DEFAULT_SOLANA_PROGRAM_ALLOWLIST } from "./security/programAllowlist.js";
 import type { AppConfig, LeaderboardWindow, TraderSource } from "./types.js";
 
@@ -98,7 +99,12 @@ const configSchema = z.object({
     simulateBeforeSign: z.boolean().default(true),
     simMaxExtraLamports: z.number().int().nonnegative().default(50_000),
     simMaxFeeLamports: z.number().int().nonnegative().default(1_000_000),
-    simMaxOverheadLamports: z.number().int().nonnegative().default(5_000_000),
+    simMaxOverheadLamports: z
+      .number()
+      .int()
+      .min(1)
+      .max(Number(OVERHEAD_HARD_CAP_LAMPORTS))
+      .default(5_000_000),
     simMaxExtraTokenOutflow: z.number().int().nonnegative().default(0),
     closeEmptyTokenAccount: z.boolean().default(true),
     quoteFailWriteoffCount: z.number().int().positive().default(5),

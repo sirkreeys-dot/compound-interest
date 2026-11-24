@@ -12,11 +12,15 @@ import {
   inspectSwapInstructions,
 } from "../security/programAllowlist.js";
 import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, rpcConnection } from "../utils/http.js";
+import { enforcedOverheadCap, overheadRejection, sumOverheadLamports } from "../security/overhead.js";
 import {
   classifySellSimulation,
   compileRoundTripForSim,
   instructionsFromSwapBody,
   roundTripSellAmount,
+  sellSimLogLine,
+  sellSimVerdict,
+  type SellSimReason,
   type SwapInstructionsBody,
 } from "../security/sellSim.js";
 import { evaluateFakeLiquidity, evaluateQuoteDepth, jupiterImpactBps, bestSolanaPair } from "../security/fakeLiquidity.js";
@@ -193,23 +197,26 @@ export class SolanaExecutor implements Executor {
     return (order.signatureFeeLamports ?? 0) + (order.prioritizationFeeLamports ?? 0);
   }
 
-  /** Quoted rent + fees above the hard ceiling are rejected in dry-run and live. */
+  /** Quoted rent + signature + priority fee, in integer lamports, under the hard cap. */
   private quotedOverheadError(order: JupiterOrder): string | null {
-    const ceiling = this.cfg.risk.simMaxOverheadLamports ?? 0;
-    if (!(ceiling > 0)) return null;
-    const has =
-      order.rentFeeLamports != null ||
-      order.signatureFeeLamports != null ||
-      order.prioritizationFeeLamports != null;
-    if (!has) return null;
-    const total =
-      (order.rentFeeLamports ?? 0) +
-      (order.signatureFeeLamports ?? 0) +
-      (order.prioritizationFeeLamports ?? 0);
-    if (total > ceiling) {
-      return `overhead: quoted rent+fees ${total} lamports > simMaxOverheadLamports ${ceiling}`;
-    }
-    return null;
+    const cap = enforcedOverheadCap(this.cfg.risk.simMaxOverheadLamports);
+    const summed = sumOverheadLamports({
+      rentFeeLamports: order.rentFeeLamports,
+      signatureFeeLamports: order.signatureFeeLamports,
+      prioritizationFeeLamports: order.prioritizationFeeLamports,
+    });
+    if (!summed.ok) return summed.error;
+    return overheadRejection(summed.total, cap);
+  }
+
+  /** Log every sell-sim outcome. A skip is not a pass; live skips refuse the buy. */
+  private finishSellSim(reason: SellSimReason, live: boolean, detail: string): string | null {
+    const line = sellSimLogLine(reason, live, detail);
+    const { outcome, refuseBuy } = sellSimVerdict(reason, live);
+    if (outcome === "passed") log.info(line);
+    else if (outcome === "skipped") log.warn(line);
+    else log.error(line);
+    return refuseBuy ? line : null;
   }
 
   /**
@@ -246,7 +253,7 @@ export class SolanaExecutor implements Executor {
     if (!(max > 0)) return null;
     const sellAmount = roundTripSellAmount(outAmount, minOutAmount);
     if (!sellAmount) {
-      return "round_trip: missing buy outAmount (fail closed)";
+      return this.finishSellSim("no_route", live, "missing buy out amount");
     }
     // No taker: /order refuses a sell transaction, and sometimes the quote, when the
     // wallet does not already hold the token. The USD check does not need a taker.
@@ -257,7 +264,7 @@ export class SolanaExecutor implements Executor {
       slippageBps: this.cfg.risk.maxSlippageBps,
       taker: null,
     });
-    if (!quoted.ok) return `round_trip: sell quote failed (fail closed): ${quoted.error}`;
+    if (!quoted.ok) return this.finishSellSim("no_route", live, quoted.error);
     let outUsd =
       quoted.order.outUsdValue != null && quoted.order.outUsdValue > 0
         ? quoted.order.outUsdValue
@@ -272,19 +279,19 @@ export class SolanaExecutor implements Executor {
       outUsd = valued?.usd ?? null;
     }
     const quoteErr = roundTripRejection(sellUsd, outUsd, max);
-    if (quoteErr) return quoteErr;
+    if (quoteErr) return this.finishSellSim("high_tax", live, quoteErr);
     const depth = await this.quoteDepthError(
       buyToken,
       jupiterImpactBps((quoted.order as { priceImpactPct?: number | string }).priceImpactPct),
     );
-    if (depth) return depth;
+    if (depth) return this.finishSellSim("high_tax", live, depth);
     const taker = this.simulationTaker();
     if (!taker) {
-      log.warn(
-        "dryRunSellSim=no_public_key: set DRY_RUN_SOLANA_PUBKEY (a public address, not a secret) to simulate the sell without a private key. The quote is not treated as proof the token can be sold.",
+      return this.finishSellSim(
+        "no_public_key",
+        live,
+        "set DRY_RUN_SOLANA_PUBKEY to a public address; the quote is not a pass",
       );
-      if (live) return "round_trip: no wallet public key to simulate the sell (fail closed)";
-      return null;
     }
     const built = await this.buildInstructionRoundTrip({
       buyMint: buyToken,
@@ -293,9 +300,8 @@ export class SolanaExecutor implements Executor {
       taker,
     });
     if (!built.ok) {
-      log.warn(`dryRunSellSim=${built.code}: ${built.error}`);
-      if (live) return `round_trip: ${built.error} (fail closed)`;
-      return null;
+      const reason: SellSimReason = built.code === "no_sell_quote" || built.code === "no_buy_quote" ? "no_route" : "sim_error";
+      return this.finishSellSim(reason, live, `${built.code}: ${built.error}`);
     }
     return this.simulateCompiledRoundTrip(built.tx, taker, live);
   }
@@ -455,11 +461,9 @@ export class SolanaExecutor implements Executor {
   ): Promise<string | null> {
     const payer = new PublicKey(taker);
     const guarded = await this.guardSwapTx(tx, payer);
-    if (!guarded.ok) return `round_trip: ${guarded.error}`;
+    if (!guarded.ok) return this.finishSellSim("allowlist", live, guarded.error);
     if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
-      if (live) return "round_trip: cannot simulate sell on loopback RPC (fail closed)";
-      log.warn("dryRunSellSim=no_rpc: loopback RPC cannot simulate the bundled sell.");
-      return null;
+      return this.finishSellSim("no_rpc", live, "loopback RPC cannot simulate the bundled sell");
     }
     try {
       const conn = rpcConnection(this.rpcUrl);
@@ -468,17 +472,15 @@ export class SolanaExecutor implements Executor {
         replaceRecentBlockhash: true,
       });
       const klass = classifySellSimulation(sim.value.err, sim.value.logs);
-      if (klass === "ok") return null;
+      if (klass === "ok") return this.finishSellSim("simulated", live, "buy-then-sell simulation succeeded");
       if (klass === "no_balance") {
-        log.warn(
-          "dryRunSellSim=no_balance: the bundled simulation could not pay for the buy or credit the token. An empty public key cannot prove the sell. This is not treated as a successful sell.",
-        );
-        if (live) return "round_trip: sell simulation had no token balance after the buy (fail closed)";
-        return null;
+        return this.finishSellSim("no_balance", live, "simulation could not fund the buy; not a pass");
       }
-      return `round_trip: sell simulation failed (honeypot, fail closed): ${JSON.stringify(sim.value.err)}`;
+      return this.finishSellSim("honeypot", live, JSON.stringify(sim.value.err));
     } catch (e) {
-      return `round_trip: sell simulation threw (fail closed): ${e instanceof Error ? e.message : String(e)}`;
+      const msg = e instanceof Error ? e.message : String(e);
+      const reason: SellSimReason = /abort|timeout/i.test(msg) ? "timeout" : "sim_error";
+      return this.finishSellSim(reason, live, msg);
     }
   }
 
@@ -595,6 +597,9 @@ export class SolanaExecutor implements Executor {
     try {
       if (!req.dryRun && !this.keypair) {
         return { ok: false, dryRun: false, error: "LIVE mode requires SOLANA_PRIVATE_KEY", pendingId };
+      }
+      if (side === "buy" && !req.dryRun && (this.cfg.filters.tokenSafety ?? "block") === "off") {
+        return { ok: false, dryRun: false, error: "token_safety is off (fail closed)", pendingId };
       }
       const headers: Record<string, string> = {};
       if (this.apiKey) headers["x-api-key"] = this.apiKey;
@@ -773,8 +778,18 @@ export class SolanaExecutor implements Executor {
         };
       }
 
-      // Pre-sign simulation (fail closed). Skip only when explicitly disabled.
-      if (this.cfg.risk.simulateBeforeSign !== false) {
+      // The bytes simulated here are the bytes signed below. Disabling simulation refuses the buy.
+      if (this.cfg.risk.simulateBeforeSign === false) {
+        this.failPending(pendingId, "simulateBeforeSign disabled");
+        return {
+          ok: false,
+          dryRun: false,
+          error: "simulateBeforeSign is off (fail closed, not signed)",
+          quoteSummary: summary,
+          pendingId,
+        };
+      }
+      {
         // Skip real RPC on loopback — tests inject via unit module; live loopback fails closed.
         if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
           this.failPending(pendingId, "sim: refused — loopback RPC cannot simulate");
@@ -796,7 +811,7 @@ export class SolanaExecutor implements Executor {
           otherAmountThreshold: order.otherAmountThreshold ?? null,
           maxExtraLamports: this.cfg.risk.simMaxExtraLamports ?? 50_000,
           maxFeeLamports: this.cfg.risk.simMaxFeeLamports ?? 1_000_000,
-          maxOverheadLamports: this.cfg.risk.simMaxOverheadLamports ?? 5_000_000,
+          maxOverheadLamports: Number(enforcedOverheadCap(this.cfg.risk.simMaxOverheadLamports)),
           reportedFeeLamports: this.reportedFees(order),
           maxExtraTokenOutflow: BigInt(this.cfg.risk.simMaxExtraTokenOutflow ?? 0),
           extraAccountKeys: guarded.accountKeys,
@@ -848,6 +863,17 @@ export class SolanaExecutor implements Executor {
         const msg = e instanceof Error ? e.message : String(e);
         this.failPending(pendingId, msg);
         return { ok: false, dryRun: false, error: redactSecrets(msg), quoteSummary: summary, pendingId };
+      }
+      const fresh = await this.blockhashUsable(tx.message.recentBlockhash);
+      if (!fresh) {
+        this.failPending(pendingId, "blockhash expired after simulation");
+        return {
+          ok: false,
+          dryRun: false,
+          error: "blockhash expired or unreadable after simulation (fail closed, not signed)",
+          quoteSummary: summary,
+          pendingId,
+        };
       }
       tx.sign([this.keypair!]);
       const signed = Buffer.from(tx.serialize()).toString("base64");
@@ -1056,6 +1082,17 @@ export class SolanaExecutor implements Executor {
       ourPubkey: our,
       allowlist: this.cfg.risk.solanaProgramAllowlist ?? [],
     });
+  }
+
+  /** Same transaction that was simulated. If the blockhash is dead or the RPC errors, do not sign. */
+  private async blockhashUsable(blockhash: string): Promise<boolean> {
+    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) return false;
+    try {
+      const res = await rpcConnection(this.rpcUrl).isBlockhashValid(blockhash, { commitment: "confirmed" });
+      return res.value === true;
+    } catch {
+      return false;
+    }
   }
 
   private async signatureOutcome(sig: string): Promise<"success" | "failed" | "pending"> {

@@ -18,6 +18,7 @@ import {
   VersionedTransaction,
   type AddressLookupTableAccount,
 } from "@solana/web3.js";
+import { checkTopLevelFundFlow } from "./fundFlow.js";
 
 export const DEFAULT_SOLANA_PROGRAM_ALLOWLIST: string[] = [
   "ComputeBudget111111111111111111111111111111",
@@ -68,6 +69,10 @@ export function inspectSwapInstructions(opts: {
   accountKeys: PublicKey[];
   ourPubkey: PublicKey;
   allowlist: string[];
+  /** Mints whose ATAs for our wallet may receive top-level token transfers. */
+  mints?: string[];
+  /** Only a fee account we configured may receive a top-level platform fee. */
+  platformFeeAccount?: string | null;
 }): InspectTxOk | InspectTxErr {
   const allow = new Set(opts.allowlist.map((s) => s.trim()).filter(Boolean));
   if (!allow.size) return { ok: false, error: "tx: program allowlist is empty (fail closed)" };
@@ -89,6 +94,7 @@ export function inspectSwapInstructions(opts: {
     return { ok: false, error: "tx: address lookup tables were not resolved (fail closed)" };
   }
 
+  const fundIxs = [];
   for (const ix of opts.tx.message.compiledInstructions) {
     const program = opts.accountKeys[ix.programIdIndex];
     if (!program) {
@@ -98,19 +104,30 @@ export function inspectSwapInstructions(opts: {
     if (!allow.has(pid)) {
       return { ok: false, error: `tx: program ${pid} is not on the allowlist` };
     }
+    const accounts = [];
     for (const idx of ix.accountKeyIndexes) {
-      if (opts.accountKeys[idx] == null) {
+      const key = opts.accountKeys[idx];
+      if (key == null) {
         return { ok: false, error: `tx: account index ${idx} unresolved (fail closed)` };
       }
+      accounts.push(key);
     }
     if (TOKEN_PROGRAMS.has(pid)) {
       const disc = ix.data?.[0];
       if (disc == null) return { ok: false, error: "tx: token instruction missing discriminator" };
-      if (FORBIDDEN_TOKEN_DISCRIMINATORS.has(disc)) {
+      if (disc !== 6 && FORBIDDEN_TOKEN_DISCRIMINATORS.has(disc)) {
         return { ok: false, error: `tx: forbidden token instruction discriminator ${disc}` };
       }
     }
+    fundIxs.push({ program: pid, data: ix.data, accounts });
   }
+  const flow = checkTopLevelFundFlow({
+    instructions: fundIxs,
+    owner: opts.ourPubkey,
+    mints: opts.mints ?? [],
+    platformFeeAccount: opts.platformFeeAccount,
+  });
+  if (!flow.ok) return flow;
   return { ok: true, accountKeys: opts.accountKeys };
 }
 

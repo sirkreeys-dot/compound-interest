@@ -238,7 +238,7 @@ describe("H6 trap tokens", () => {
     const payer = Keypair.generate();
     const dest = Keypair.generate().publicKey;
     const leg = (lamports: number) =>
-      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: dest, lamports });
+      SystemProgram.transfer({ fromPubkey: payer.publicKey, toPubkey: payer.publicKey, lamports });
     const { tx, bytes } = compileRoundTripForSim({
       buyIxs: [leg(1)],
       sellIxs: [leg(2)],

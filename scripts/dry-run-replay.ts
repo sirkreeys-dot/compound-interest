@@ -21,6 +21,11 @@ async function main(): Promise<void> {
   process.env.DRY_RUN = "true";
   const env = loadEnv();
   env.dryRun = true;
+  log.info(
+    process.env.SOLANA_RPC_URL?.trim()
+      ? "Replay RPC: SOLANA_RPC_URL from the environment (URL not logged)"
+      : "Replay RPC: no SOLANA_RPC_URL set, using the built-in public default",
+  );
 
   const configPath = fs.existsSync(path.join(root, "config.yaml"))
     ? path.join(root, "config.yaml")

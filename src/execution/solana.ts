@@ -12,6 +12,7 @@ import {
   inspectSwapInstructions,
 } from "../security/programAllowlist.js";
 import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, rpcConnection } from "../utils/http.js";
+import { afterBlockhashCheck, outAmountDiverged, sameMessageBytes } from "../security/simGap.js";
 import { enforcedOverheadCap, overheadRejection, sumOverheadLamports } from "../security/overhead.js";
 import {
   classifySellSimulation,
@@ -95,6 +96,8 @@ export class SolanaExecutor implements Executor {
   private readonly store: Store | null;
   /** Public taker for DRY_RUN sell simulation. Never a signing key. */
   private readonly dryRunPubkey: string;
+  /** Out amount of the buy leg inside the last round-trip simulation quote. */
+  private roundTripBuyOut: string | null = null;
 
   constructor(env: EnvConfig, cfg: AppConfig, prices: PriceService, store: Store | null = null) {
     this.cfg = cfg;
@@ -303,7 +306,7 @@ export class SolanaExecutor implements Executor {
       const reason: SellSimReason = built.code === "no_sell_quote" || built.code === "no_buy_quote" ? "no_route" : "sim_error";
       return this.finishSellSim(reason, live, `${built.code}: ${built.error}`);
     }
-    return this.simulateCompiledRoundTrip(built.tx, taker, live);
+    return this.simulateCompiledRoundTrip(built.tx, taker, live, [buyToken, this.cfg.quote.solanaNative]);
   }
 
   private async quoteDepthError(mint: string, sellImpactBps: number | null): Promise<string | null> {
@@ -348,6 +351,8 @@ export class SolanaExecutor implements Executor {
     const native = this.cfg.quote.solanaNative;
     const buyQuote = await this.swapQuoteV1(native, opts.buyMint, opts.buyAmountRaw);
     if (!buyQuote.ok) return { ok: false, code: "no_buy_quote", error: buyQuote.error };
+    const buyOut = (buyQuote.quote as { outAmount?: string }).outAmount;
+    this.roundTripBuyOut = buyOut && /^\d+$/.test(buyOut) ? buyOut : null;
     const sellQuote = await this.swapQuoteV1(opts.buyMint, native, opts.sellAmountRaw);
     if (!sellQuote.ok) return { ok: false, code: "no_sell_quote", error: sellQuote.error };
     const buyIxs = await this.swapInstructions(buyQuote.quote, opts.taker);
@@ -458,9 +463,10 @@ export class SolanaExecutor implements Executor {
     tx: VersionedTransaction,
     taker: string,
     live: boolean,
+    mints: string[],
   ): Promise<string | null> {
     const payer = new PublicKey(taker);
-    const guarded = await this.guardSwapTx(tx, payer);
+    const guarded = await this.guardSwapTx(tx, payer, mints);
     if (!guarded.ok) return this.finishSellSim("allowlist", live, guarded.error);
     if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
       return this.finishSellSim("no_rpc", live, "loopback RPC cannot simulate the bundled sell");
@@ -700,6 +706,22 @@ export class SolanaExecutor implements Executor {
             ...this.feeFields(order, req, side),
           };
         }
+        if (
+          this.roundTripBuyOut &&
+          outAmountDiverged(order.outAmount ?? "", this.roundTripBuyOut, req.slippageBps)
+        ) {
+          return {
+            ok: false,
+            dryRun: req.dryRun,
+            error: `sell_sim price moved: order out ${order.outAmount ?? "?"} vs round-trip buy ${this.roundTripBuyOut} beyond slippage ${req.slippageBps}bps`,
+            quoteSummary: summary,
+            outUsd,
+            outAmountRaw: order.outAmount,
+            inAmountRaw: order.inAmount ?? amount,
+            pendingId,
+            ...this.feeFields(order, req, side),
+          };
+        }
       }
 
       if (side === "buy") {
@@ -743,54 +765,68 @@ export class SolanaExecutor implements Executor {
         };
       }
 
-      const validated = validateJupiterOrder({
-        order,
-        expectedInputMint: req.sellToken,
-        expectedOutputMint: req.buyToken,
-        expectedInAmount: amount,
-        maxSlippageBps: req.slippageBps,
-        ourPubkey: this.keypair!.publicKey,
-        sellUsd: req.sellUsd,
-        outUsd,
-        maxChaseBps: this.cfg.risk.maxChaseBps,
-      });
-      if (!validated.ok) {
-        this.failPending(pendingId, validated.error);
-        return {
-          ok: false,
-          dryRun: false,
-          error: redactSecrets(validated.error),
-          quoteSummary: summary,
-          pendingId,
-        };
-      }
+      let liveOrder = order;
+      let tx: VersionedTransaction | null = null;
+      let simulatedMessage: Uint8Array | null = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        if (
+          side === "buy" &&
+          this.roundTripBuyOut &&
+          outAmountDiverged(liveOrder.outAmount ?? "", this.roundTripBuyOut, req.slippageBps)
+        ) {
+          return {
+            ok: false,
+            dryRun: false,
+            error: `sell_sim price moved: order out ${liveOrder.outAmount ?? "?"} vs round-trip buy ${this.roundTripBuyOut} beyond slippage ${req.slippageBps}bps`,
+            quoteSummary: summary,
+            pendingId,
+          };
+        }
+        const validated = validateJupiterOrder({
+          order: liveOrder,
+          expectedInputMint: req.sellToken,
+          expectedOutputMint: req.buyToken,
+          expectedInAmount: amount,
+          maxSlippageBps: req.slippageBps,
+          ourPubkey: this.keypair!.publicKey,
+          sellUsd: req.sellUsd,
+          outUsd,
+          maxChaseBps: this.cfg.risk.maxChaseBps,
+        });
+        if (!validated.ok) {
+          this.failPending(pendingId, validated.error);
+          return {
+            ok: false,
+            dryRun: false,
+            error: redactSecrets(validated.error),
+            quoteSummary: summary,
+            pendingId,
+          };
+        }
 
-      const tx: VersionedTransaction = validated.tx;
-      const guarded = await this.guardSwapTx(tx);
-      if (!guarded.ok) {
-        this.failPending(pendingId, guarded.error);
-        return {
-          ok: false,
-          dryRun: false,
-          error: redactSecrets(guarded.error),
-          quoteSummary: summary,
-          pendingId,
-        };
-      }
+        const candidate = validated.tx;
+        const guarded = await this.guardSwapTx(candidate, undefined, [req.sellToken, req.buyToken]);
+        if (!guarded.ok) {
+          this.failPending(pendingId, guarded.error);
+          return {
+            ok: false,
+            dryRun: false,
+            error: redactSecrets(guarded.error),
+            quoteSummary: summary,
+            pendingId,
+          };
+        }
 
-      // The bytes simulated here are the bytes signed below. Disabling simulation refuses the buy.
-      if (this.cfg.risk.simulateBeforeSign === false) {
-        this.failPending(pendingId, "simulateBeforeSign disabled");
-        return {
-          ok: false,
-          dryRun: false,
-          error: "simulateBeforeSign is off (fail closed, not signed)",
-          quoteSummary: summary,
-          pendingId,
-        };
-      }
-      {
-        // Skip real RPC on loopback — tests inject via unit module; live loopback fails closed.
+        if (this.cfg.risk.simulateBeforeSign === false) {
+          this.failPending(pendingId, "simulateBeforeSign disabled");
+          return {
+            ok: false,
+            dryRun: false,
+            error: "simulateBeforeSign is off (fail closed, not signed)",
+            quoteSummary: summary,
+            pendingId,
+          };
+        }
         if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
           this.failPending(pendingId, "sim: refused — loopback RPC cannot simulate");
           return {
@@ -801,18 +837,19 @@ export class SolanaExecutor implements Executor {
             pendingId,
           };
         }
+        const messageBefore = new Uint8Array(candidate.message.serialize());
         const sim = await simulateAndValidateSwap({
           rpcUrl: this.rpcUrl,
-          tx,
+          tx: candidate,
           ourPubkey: this.keypair!.publicKey,
           inputMint: req.sellToken,
           outputMint: req.buyToken,
-          expectedInAmount: order.inAmount ?? amount,
-          otherAmountThreshold: order.otherAmountThreshold ?? null,
+          expectedInAmount: liveOrder.inAmount ?? amount,
+          otherAmountThreshold: liveOrder.otherAmountThreshold ?? null,
           maxExtraLamports: this.cfg.risk.simMaxExtraLamports ?? 50_000,
           maxFeeLamports: this.cfg.risk.simMaxFeeLamports ?? 1_000_000,
           maxOverheadLamports: Number(enforcedOverheadCap(this.cfg.risk.simMaxOverheadLamports)),
-          reportedFeeLamports: this.reportedFees(order),
+          reportedFeeLamports: this.reportedFees(liveOrder),
           maxExtraTokenOutflow: BigInt(this.cfg.risk.simMaxExtraTokenOutflow ?? 0),
           extraAccountKeys: guarded.accountKeys,
         });
@@ -826,6 +863,71 @@ export class SolanaExecutor implements Executor {
             pendingId,
           };
         }
+        if (!sameMessageBytes(messageBefore, candidate.message.serialize())) {
+          this.failPending(pendingId, "simulated message bytes changed");
+          return {
+            ok: false,
+            dryRun: false,
+            error: "simulated transaction message changed before sign (fail closed, not signed)",
+            quoteSummary: summary,
+            pendingId,
+          };
+        }
+        const step = afterBlockhashCheck(attempt, await this.blockhashUsable(candidate.message.recentBlockhash));
+        if (step === "abort") {
+          this.failPending(pendingId, "blockhash expired after one re-quote");
+          return {
+            ok: false,
+            dryRun: false,
+            error: "blockhash expired after one re-quote (fail closed, not signed)",
+            quoteSummary: summary,
+            pendingId,
+          };
+        }
+        if (step === "requote") {
+          const again = await this.requestOrder({
+            inputMint: req.sellToken,
+            outputMint: req.buyToken,
+            amount,
+            slippageBps: req.slippageBps,
+            taker: this.keypair!.publicKey.toBase58(),
+          });
+          if (!again.ok) {
+            this.failPending(pendingId, again.error);
+            return { ok: false, dryRun: false, error: again.error, quoteSummary: summary, pendingId };
+          }
+          const overhead = this.quotedOverheadError(again.order);
+          if (overhead) {
+            return { ok: false, dryRun: false, error: overhead, quoteSummary: summary, pendingId };
+          }
+          if (side === "buy") {
+            const tolBps = this.cfg.risk.inUsdToleranceBps ?? 200;
+            if (!jupiterInUsdAllowed(again.order.inUsdValue, this.cfg.sizing.maxUsdPerTrade, tolBps)) {
+              return {
+                ok: false,
+                dryRun: false,
+                error: `in_usd: re-quote inUsdValue ${again.order.inUsdValue ?? "missing"} exceeds maxUsdPerTrade`,
+                quoteSummary: summary,
+                pendingId,
+              };
+            }
+          }
+          liveOrder = again.order;
+          continue;
+        }
+        tx = candidate;
+        simulatedMessage = messageBefore;
+        break;
+      }
+      if (!tx || !simulatedMessage || !sameMessageBytes(simulatedMessage, tx.message.serialize())) {
+        this.failPending(pendingId, "no simulated transaction to sign");
+        return {
+          ok: false,
+          dryRun: false,
+          error: "no simulated transaction to sign (fail closed)",
+          quoteSummary: summary,
+          pendingId,
+        };
       }
 
       // Ensure pending row exists before broadcast (buys and sells).
@@ -844,15 +946,15 @@ export class SolanaExecutor implements Executor {
             sizeUsd: req.sellUsd,
             sellToken: req.sellToken,
             buyToken: req.buyToken,
-            inAmountRaw: order.inAmount ?? amount,
-            expectedOutRaw: order.outAmount ?? null,
+            inAmountRaw: liveOrder.inAmount ?? amount,
+            expectedOutRaw: liveOrder.outAmount ?? null,
             notes: "created_by_executor",
             positionId: req.positionId ?? null,
           });
         } else {
           this.store.updatePendingSwap(pendingId, {
-            inAmountRaw: order.inAmount ?? amount,
-            expectedOutRaw: order.outAmount ?? null,
+            inAmountRaw: liveOrder.inAmount ?? amount,
+            expectedOutRaw: liveOrder.outAmount ?? null,
           });
         }
       }
@@ -864,13 +966,12 @@ export class SolanaExecutor implements Executor {
         this.failPending(pendingId, msg);
         return { ok: false, dryRun: false, error: redactSecrets(msg), quoteSummary: summary, pendingId };
       }
-      const fresh = await this.blockhashUsable(tx.message.recentBlockhash);
-      if (!fresh) {
-        this.failPending(pendingId, "blockhash expired after simulation");
+      if (!sameMessageBytes(simulatedMessage, tx.message.serialize())) {
+        this.failPending(pendingId, "message changed after simulation");
         return {
           ok: false,
           dryRun: false,
-          error: "blockhash expired or unreadable after simulation (fail closed, not signed)",
+          error: "transaction message changed after simulation (fail closed, not signed)",
           quoteSummary: summary,
           pendingId,
         };
@@ -895,7 +996,7 @@ export class SolanaExecutor implements Executor {
           blockhash: tx.message.recentBlockhash,
           lastValidBlockHeight,
           positionId: req.positionId ?? null,
-          notes: `signed_before_execute requestId=${order.requestId ?? ""}`,
+          notes: `signed_before_execute requestId=${liveOrder.requestId ?? ""}`,
         });
       }
 
@@ -904,7 +1005,7 @@ export class SolanaExecutor implements Executor {
         {
           method: "POST",
           headers: { "Content-Type": "application/json", ...headers },
-          body: JSON.stringify({ signedTransaction: signed, requestId: order.requestId }),
+          body: JSON.stringify({ signedTransaction: signed, requestId: liveOrder.requestId }),
         },
         EXECUTE_TIMEOUT_MS,
       );
@@ -1053,6 +1154,7 @@ export class SolanaExecutor implements Executor {
   private async guardSwapTx(
     tx: VersionedTransaction,
     payer?: PublicKey,
+    mints: string[] = [],
   ): Promise<{ ok: true; accountKeys: import("@solana/web3.js").PublicKey[] } | { ok: false; error: string }> {
     const our = payer ?? this.keypair?.publicKey;
     if (!our) return { ok: false, error: "tx: no wallet" };
@@ -1081,6 +1183,7 @@ export class SolanaExecutor implements Executor {
       accountKeys,
       ourPubkey: our,
       allowlist: this.cfg.risk.solanaProgramAllowlist ?? [],
+      mints,
     });
   }
 

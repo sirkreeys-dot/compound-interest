@@ -1,0 +1,13 @@
+title = "compound-interest gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Public Solana mint addresses used as test fixtures. They are not keys."
+regexes = [
+  '''6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP''',
+  '''DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263''',
+  '''EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v''',
+  '''So11111111111111111111111111111111111111112''',
+]

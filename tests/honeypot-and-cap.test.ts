@@ -11,7 +11,7 @@ import {
   sumOverheadLamports,
 } from "../src/security/overhead.js";
 import { roundTripRejection } from "../src/security/roundTrip.js";
-import { sellSimLogLine, sellSimVerdict, type SellSimReason } from "../src/security/sellSim.js";
+import { sellSimLogLine, sellSimReasonFromRpc, sellSimVerdict, type SellSimReason } from "../src/security/sellSim.js";
 import { inspectSolanaMint } from "../src/security/tokenSafety.js";
 
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -85,6 +85,16 @@ describe("sell simulation outcomes", () => {
     assert.equal(ok.outcome, "passed");
     assert.equal(ok.refuseBuy, false);
     assert.match(sellSimLogLine("simulated", true, "buy-then-sell simulation succeeded"), /outcome=passed/);
+    assert.doesNotMatch(sellSimLogLine("no_balance", true, "not a pass"), /outcome=passed/);
+  });
+
+  it("a null simulation body is a failure, not a pass", () => {
+    assert.equal(sellSimReasonFromRpc(null), "sim_error");
+    assert.equal(sellSimReasonFromRpc(undefined), "sim_error");
+    const line = sellSimLogLine("sim_error", true, "null simulation response");
+    assert.match(line, /outcome=failed/);
+    assert.equal(sellSimVerdict("sim_error", true).refuseBuy, true);
+    assert.equal(sellSimReasonFromRpc({ err: null, logs: [] }), "simulated");
   });
 });
 

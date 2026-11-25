@@ -47,6 +47,17 @@ export function sellSimLogLine(reason: SellSimReason, live: boolean, detail: str
   return `sell_sim outcome=${outcome} reason=${reason} mode=${live ? "live" : "dry_run"} detail=${detail}`;
 }
 
+/** A missing RPC body is a failure, not a pass. `err: null` is a successful simulation. */
+export function sellSimReasonFromRpc(
+  value: { err?: unknown; logs?: string[] | null } | null | undefined,
+): SellSimReason {
+  if (value == null) return "sim_error";
+  const klass = classifySellSimulation(value.err, value.logs);
+  if (klass === "ok") return "simulated";
+  if (klass === "no_balance") return "no_balance";
+  return "honeypot";
+}
+
 /** Serialized v0 transactions must stay within this many bytes. */
 export const SIM_TX_SIZE_LIMIT = 1232;
 

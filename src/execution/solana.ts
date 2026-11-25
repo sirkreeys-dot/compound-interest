@@ -15,11 +15,11 @@ import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, rpcConn
 import { afterBlockhashCheck, outAmountDiverged, sameMessageBytes } from "../security/simGap.js";
 import { enforcedOverheadCap, overheadRejection, sumOverheadLamports } from "../security/overhead.js";
 import {
-  classifySellSimulation,
   compileRoundTripForSim,
   instructionsFromSwapBody,
   roundTripSellAmount,
   sellSimLogLine,
+  sellSimReasonFromRpc,
   sellSimVerdict,
   type SellSimReason,
   type SwapInstructionsBody,
@@ -477,12 +477,13 @@ export class SolanaExecutor implements Executor {
         sigVerify: false,
         replaceRecentBlockhash: true,
       });
-      const klass = classifySellSimulation(sim.value.err, sim.value.logs);
-      if (klass === "ok") return this.finishSellSim("simulated", live, "buy-then-sell simulation succeeded");
-      if (klass === "no_balance") {
+      const reason = sellSimReasonFromRpc(sim.value);
+      if (reason === "simulated") return this.finishSellSim("simulated", live, "buy-then-sell simulation succeeded");
+      if (reason === "no_balance") {
         return this.finishSellSim("no_balance", live, "simulation could not fund the buy; not a pass");
       }
-      return this.finishSellSim("honeypot", live, JSON.stringify(sim.value.err));
+      if (reason === "sim_error") return this.finishSellSim("sim_error", live, "null simulation response");
+      return this.finishSellSim("honeypot", live, JSON.stringify(sim.value?.err));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const reason: SellSimReason = /abort|timeout/i.test(msg) ? "timeout" : "sim_error";

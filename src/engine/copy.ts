@@ -16,6 +16,7 @@ import { KeyedMutex, Mutex } from "../utils/mutex.js";
 import { scaleRawAmount } from "../utils/money.js";
 import { redactSecrets } from "../security/redact.js";
 import { slippageDriftBps } from "../ops/drift.js";
+import { ladderStep, rateLimitBackoffMs, sleepRateLimit } from "../execution/jupiterLimit.js";
 
 const CLAIM_ON_SKIP = new Set<SkipReason>([
   "trader_not_watched",
@@ -710,25 +711,44 @@ Live buy succeeded but DB insert failed.\npending=<code>${pendingId}</code>\ntx=
         : [this.cfg.risk.maxSlippageBps];
     let result: SwapResult | undefined;
     for (const bps of ladder) {
-      result = await this.exec.sell(locked.chain, {
-        sellToken: locked.tokenAddress,
-        buyToken: "",
-        sellUsd: locked.remainingUsd * fraction,
-        sellAmountRaw: sellRaw,
-        slippageBps: bps,
-        dryRun,
-        positionId: locked.id,
-      });
-      if (result.ok) break;
-      if (result.inFlight) {
+      let rateAttempts = 0;
+      for (;;) {
+        result = await this.exec.sell(locked.chain, {
+          sellToken: locked.tokenAddress,
+          buyToken: "",
+          sellUsd: locked.remainingUsd * fraction,
+          sellAmountRaw: sellRaw,
+          slippageBps: bps,
+          dryRun,
+          positionId: locked.id,
+        });
+        const step = ladderStep({
+          ok: result.ok,
+          inFlight: result.inFlight === true,
+          error: result.error,
+          rateAttempts,
+        });
+        if (step === "success") break;
+        if (step === "in-flight") {
+          log.warn(
+            `Sell ${locked.tokenSymbol ?? locked.tokenAddress} signature still in flight — not signing the next slippage rung`,
+          );
+          return;
+        }
+        if (step === "retry-same-rung") {
+          log.warn(
+            `Sell ${locked.tokenSymbol ?? locked.tokenAddress} at ${bps}bps rate limited — retrying this rung`,
+          );
+          await sleepRateLimit(rateLimitBackoffMs(rateAttempts, null));
+          rateAttempts++;
+          continue;
+        }
         log.warn(
-          `Sell ${locked.tokenSymbol ?? locked.tokenAddress} signature still in flight — not signing the next slippage rung`,
+          `Sell ${locked.tokenSymbol ?? locked.tokenAddress} at ${bps}bps failed: ${result.error ?? "unknown"}`,
         );
-        return;
+        break;
       }
-      log.warn(
-        `Sell ${locked.tokenSymbol ?? locked.tokenAddress} at ${bps}bps failed: ${result.error ?? "unknown"}`,
-      );
+      if (result?.ok) break;
     }
 
     if (!result || !result.ok) {

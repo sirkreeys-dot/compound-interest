@@ -95,6 +95,40 @@ export function jupiterInstruction(raw: JupiterInstructionJson): TransactionInst
   });
 }
 
+/** Lookup tables named by Jupiter. Nothing is read from config. */
+export function altAddressesFromSwapBodies(bodies: SwapInstructionsBody[]): string[] {
+  const out: string[] = [];
+  for (const body of bodies) {
+    const listed = [
+      ...(body.addressLookupTableAddresses ?? []),
+      ...((body as { addressLookupTableAccounts?: string[] | null }).addressLookupTableAccounts ?? []),
+    ];
+    for (const addr of listed) {
+      if (addr && !out.includes(addr)) out.push(addr);
+    }
+  }
+  return out;
+}
+
+/** First quote uses Jupiter's default. The next two ask for a shorter route. */
+export const ROUND_TRIP_ACCOUNT_CAPS: Array<number | undefined> = [undefined, 40, 30];
+
+export function dedupeInstructions(ixs: TransactionInstruction[]): TransactionInstruction[] {
+  const seen = new Set<string>();
+  const out: TransactionInstruction[] = [];
+  for (const ix of ixs) {
+    const id = [
+      ix.programId.toBase58(),
+      Buffer.from(ix.data).toString("base64"),
+      ...ix.keys.map((k) => `${k.pubkey.toBase58()}:${k.isSigner ? 1 : 0}:${k.isWritable ? 1 : 0}`),
+    ].join("|");
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(ix);
+  }
+  return out;
+}
+
 /** Setup, swap, then cleanup. Compute-budget instructions are omitted; the sim tx sets one limit for both legs. */
 export function instructionsFromSwapBody(body: SwapInstructionsBody): TransactionInstruction[] {
   const raw = [
@@ -117,18 +151,33 @@ export function compileRoundTripForSim(opts: {
   lookupTables?: AddressLookupTableAccount[];
   recentBlockhash: string;
 }): { tx: VersionedTransaction; bytes: number } {
-  const instructions = [
+  const instructions = dedupeInstructions([
     ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
     ...opts.buyIxs,
     ...opts.sellIxs,
-  ];
-  const msg = new TransactionMessage({
-    payerKey: opts.payer,
-    recentBlockhash: opts.recentBlockhash,
-    instructions,
-  }).compileToV0Message(opts.lookupTables ?? []);
-  const tx = new VersionedTransaction(msg);
-  const bytes = tx.serialize().length;
+  ]);
+  const tables: AddressLookupTableAccount[] = [];
+  const seenTables = new Set<string>();
+  for (const table of opts.lookupTables ?? []) {
+    const key = table.key.toBase58();
+    if (seenTables.has(key)) continue;
+    seenTables.add(key);
+    tables.push(table);
+  }
+  let tx: VersionedTransaction;
+  let bytes = SIM_TX_SIZE_LIMIT + 1;
+  try {
+    const msg = new TransactionMessage({
+      payerKey: opts.payer,
+      recentBlockhash: opts.recentBlockhash,
+      instructions,
+    }).compileToV0Message(tables);
+    tx = new VersionedTransaction(msg);
+    bytes = tx.serialize().length;
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    throw new Error(`round_trip: combined transaction exceeds ${SIM_TX_SIZE_LIMIT} bytes (${detail})`);
+  }
   if (bytes > SIM_TX_SIZE_LIMIT) {
     throw new Error(`round_trip: combined transaction is ${bytes} bytes > ${SIM_TX_SIZE_LIMIT}`);
   }

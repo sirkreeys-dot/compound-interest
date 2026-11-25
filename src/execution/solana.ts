@@ -11,10 +11,13 @@ import {
   accountKeysFromLoadedMessage,
   inspectSwapInstructions,
 } from "../security/programAllowlist.js";
+import { jupiterFetch, type JupiterPriority } from "./jupiterLimit.js";
 import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, isLoopbackRpc, rpcConnection, withRpcFailover } from "../utils/http.js";
 import { afterBlockhashCheck, outAmountDiverged, sameMessageBytes } from "../security/simGap.js";
 import { enforcedOverheadCap, overheadRejection, sumOverheadLamports } from "../security/overhead.js";
 import {
+  ROUND_TRIP_ACCOUNT_CAPS,
+  altAddressesFromSwapBodies,
   compileRoundTripForSim,
   instructionsFromSwapBody,
   roundTripSellAmount,
@@ -204,6 +207,7 @@ export class SolanaExecutor implements Executor {
     amount: string;
     slippageBps: number;
     taker: string | null;
+    priority?: JupiterPriority;
   }): Promise<{ ok: true; order: JupiterOrder } | { ok: false; error: string }> {
     if (this.routeProvider) return this.routeProvider.order(opts);
     const params = new URLSearchParams({
@@ -213,11 +217,11 @@ export class SolanaExecutor implements Executor {
       slippageBps: String(opts.slippageBps),
     });
     if (opts.taker) params.set("taker", opts.taker);
-    const headers: Record<string, string> = {};
-    if (this.apiKey) headers["x-api-key"] = this.apiKey;
-    const orderRes = await fetchRetry(`${JUP_BASE}/order?${params}`, { headers }, {
-      timeoutMs: QUOTE_TIMEOUT_MS,
-      retries: 2,
+    const priority = opts.priority ?? "buy";
+    const orderRes = await jupiterFetch(`${JUP_BASE}/order?${params}`, { method: "GET" }, {
+      apiKey: this.apiKey,
+      priority,
+      retry429: priority !== "sell",
     });
     if (!orderRes.ok) {
       const t = await orderRes.text();
@@ -384,43 +388,41 @@ export class SolanaExecutor implements Executor {
     taker: string;
   }): Promise<{ ok: true; tx: VersionedTransaction } | { ok: false; code: string; error: string }> {
     const native = this.cfg.quote.solanaNative;
-    const buyQuote = await this.swapQuoteV1(native, opts.buyMint, opts.buyAmountRaw);
-    if (!buyQuote.ok) return { ok: false, code: "no_buy_quote", error: buyQuote.error };
-    const buyOut = (buyQuote.quote as { outAmount?: string }).outAmount;
-    this.roundTripBuyOut = buyOut && /^\d+$/.test(buyOut) ? buyOut : null;
-    const sellQuote = await this.swapQuoteV1(opts.buyMint, native, opts.sellAmountRaw);
-    if (!sellQuote.ok) return { ok: false, code: "no_sell_quote", error: sellQuote.error };
-    const buyIxs = await this.swapInstructions(buyQuote.quote, opts.taker);
-    if (!buyIxs.ok) return { ok: false, code: "no_sell_instructions", error: buyIxs.error };
-    const sellIxs = await this.swapInstructions(sellQuote.quote, opts.taker);
-    if (!sellIxs.ok) return { ok: false, code: "no_sell_instructions", error: sellIxs.error };
-    const tables = await this.loadAltAddresses([
-      ...(buyIxs.body.addressLookupTableAddresses ?? []),
-      ...(sellIxs.body.addressLookupTableAddresses ?? []),
-    ]);
-    if (!tables.ok) return { ok: false, code: "bundle_unavailable", error: tables.error };
-    try {
-      const { tx } = compileRoundTripForSim({
-        buyIxs: instructionsFromSwapBody(buyIxs.body),
-        sellIxs: instructionsFromSwapBody(sellIxs.body),
-        payer: new PublicKey(opts.taker),
-        lookupTables: tables.tables,
-        recentBlockhash: new PublicKey(opts.taker).toBase58(),
-      });
-      return { ok: true, tx };
-    } catch (e) {
-      return {
-        ok: false,
-        code: "bundle_unavailable",
-        error: e instanceof Error ? e.message : String(e),
-      };
+    let lastError = "round trip was not built";
+    for (const maxAccounts of ROUND_TRIP_ACCOUNT_CAPS) {
+      const buyQuote = await this.swapQuoteV1(native, opts.buyMint, opts.buyAmountRaw, maxAccounts);
+      if (!buyQuote.ok) return { ok: false, code: "no_buy_quote", error: buyQuote.error };
+      const buyOut = (buyQuote.quote as { outAmount?: string }).outAmount;
+      this.roundTripBuyOut = buyOut && /^\d+$/.test(buyOut) ? buyOut : null;
+      const sellQuote = await this.swapQuoteV1(opts.buyMint, native, opts.sellAmountRaw, maxAccounts);
+      if (!sellQuote.ok) return { ok: false, code: "no_sell_quote", error: sellQuote.error };
+      const buyIxs = await this.swapInstructions(buyQuote.quote, opts.taker);
+      if (!buyIxs.ok) return { ok: false, code: "no_sell_instructions", error: buyIxs.error };
+      const sellIxs = await this.swapInstructions(sellQuote.quote, opts.taker);
+      if (!sellIxs.ok) return { ok: false, code: "no_sell_instructions", error: sellIxs.error };
+      const tables = await this.loadAltAddresses(altAddressesFromSwapBodies([buyIxs.body, sellIxs.body]));
+      if (!tables.ok) return { ok: false, code: "bundle_unavailable", error: tables.error };
+      try {
+        const { tx } = compileRoundTripForSim({
+          buyIxs: instructionsFromSwapBody(buyIxs.body),
+          sellIxs: instructionsFromSwapBody(sellIxs.body),
+          payer: new PublicKey(opts.taker),
+          lookupTables: tables.tables,
+          recentBlockhash: new PublicKey(opts.taker).toBase58(),
+        });
+        return { ok: true, tx };
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e);
+      }
     }
+    return { ok: false, code: "bundle_unavailable", error: lastError };
   }
 
   private async swapQuoteV1(
     inputMint: string,
     outputMint: string,
     amount: string,
+    maxAccounts?: number,
   ): Promise<{ ok: true; quote: unknown } | { ok: false; error: string }> {
     const params = new URLSearchParams({
       inputMint,
@@ -428,8 +430,12 @@ export class SolanaExecutor implements Executor {
       amount,
       slippageBps: String(this.cfg.risk.maxSlippageBps),
     });
+    if (maxAccounts != null) params.set("maxAccounts", String(maxAccounts));
     try {
-      const res = await fetchRetry(`${JUP_IX}/quote?${params}`, {}, { timeoutMs: QUOTE_TIMEOUT_MS, retries: 2 });
+      const res = await jupiterFetch(`${JUP_IX}/quote?${params}`, { method: "GET" }, {
+        apiKey: this.apiKey,
+        priority: "buy",
+      });
       if (!res.ok) {
         const t = await res.text();
         return { ok: false, error: redactSecrets(`Jupiter quote ${res.status}: ${t.slice(0, 180)}`) };
@@ -445,11 +451,11 @@ export class SolanaExecutor implements Executor {
     userPublicKey: string,
   ): Promise<{ ok: true; body: SwapInstructionsBody } | { ok: false; error: string }> {
     try {
-      const res = await fetchRetry(
+      const res = await jupiterFetch(
         `${JUP_IX}/swap-instructions`,
         {
           method: "POST",
-          headers: { "content-type": "application/json", ...(this.apiKey ? { "x-api-key": this.apiKey } : {}) },
+          headers: { "content-type": "application/json" },
           body: JSON.stringify({
             quoteResponse: quote,
             userPublicKey,
@@ -457,7 +463,7 @@ export class SolanaExecutor implements Executor {
             dynamicComputeUnitLimit: true,
           }),
         },
-        { timeoutMs: QUOTE_TIMEOUT_MS, retries: 2 },
+        { apiKey: this.apiKey, priority: "buy" },
       );
       if (!res.ok) {
         const t = await res.text();
@@ -687,6 +693,7 @@ export class SolanaExecutor implements Executor {
           this.requestOrder({
             inputMint: req.sellToken,
             outputMint: req.buyToken,
+            priority: side,
             amount,
             slippageBps: req.slippageBps,
             taker,
@@ -945,6 +952,7 @@ export class SolanaExecutor implements Executor {
             amount,
             slippageBps: req.slippageBps,
             taker: this.keypair!.publicKey.toBase58(),
+            priority: side,
           });
           if (!again.ok) {
             this.failPending(pendingId, again.error);

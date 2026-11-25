@@ -6,6 +6,7 @@
  * Jupiter: GET https://api.jup.ag/price/v3?ids=<mint> → { [mint]: { usdPrice, blockId, decimals } }
  * 0x: GET https://api.0x.org/swap/allowance-holder/price?chainId=8453&sellToken=0xEeee…&buyToken=USDC&sellAmount=1e18
  */
+import { jupiterFetch } from "../execution/jupiterLimit.js";
 import { fetchRetry } from "./http.js";
 import { log } from "./logger.js";
 import { ZEROX_NATIVE_ETH } from "./money.js";
@@ -173,9 +174,11 @@ export class PriceService {
   }
 
   private async fetchJupiterPriceV3(mint: string): Promise<FreshPrice | null> {
-    const headers: Record<string, string> = {};
-    if (this.jupiterApiKey) headers["x-api-key"] = this.jupiterApiKey;
-    const res = await this.http(`https://api.jup.ag/price/v3?ids=${mint}`, { headers });
+    const res = await jupiterFetch(
+      `https://api.jup.ag/price/v3?ids=${mint}`,
+      { method: "GET" },
+      { apiKey: this.jupiterApiKey, priority: "buy", fetchImpl: this.fetchImpl },
+    );
     if (!res.ok) return null;
     const body = (await res.json()) as Record<
       string,
@@ -193,14 +196,16 @@ export class PriceService {
 
   /** Derive SOL/USD from swap/v2/order: 1 SOL → USDC outAmount/1e6, or use outUsdValue. */
   private async fetchSolViaJupiterOrder(): Promise<FreshPrice | null> {
-    const headers: Record<string, string> = {};
-    if (this.jupiterApiKey) headers["x-api-key"] = this.jupiterApiKey;
     const params = new URLSearchParams({
       inputMint: SOL_MINT,
       outputMint: USDC_SOL,
       amount: "1000000000", // 1 SOL
     });
-    const res = await this.http(`https://api.jup.ag/swap/v2/order?${params}`, { headers });
+    const res = await jupiterFetch(
+      `https://api.jup.ag/swap/v2/order?${params}`,
+      { method: "GET" },
+      { apiKey: this.jupiterApiKey, priority: "buy", fetchImpl: this.fetchImpl },
+    );
     if (!res.ok) return null;
     const order = (await res.json()) as {
       outAmount?: string;

@@ -93,6 +93,7 @@ risk:
   solPriceDivergenceBps: 250       # Jupiter vs CoinGecko SOL/USD; wider than this refuses the buy
   maxConsecutiveFailures: 3        # pause new entries after this many live buy failures in a row. 0 is refused live.
   maxWalletSol: 1                  # refuse live startup above this balance. Stricter is allowed; above 1 SOL is refused.
+  jupiterMaxRequestsPerSec: 2      # shared cap for every Jupiter call. Sells go ahead of queued buys.
   # solanaProgramAllowlist defaults in code. It is the top-level programs seen on a
   # public Jupiter /order (Compute Budget, System, Token, Token-2022, ATA, Jupiter v6)
   # plus DEX programs Jupiter sometimes calls directly. JupiterZ co-signed orders are

@@ -12,6 +12,7 @@ import { ExecutionRouter } from "../src/execution/index.js";
 import { TelegramNotifier } from "../src/notify/telegram.js";
 import { Store } from "../src/store/db.js";
 import { KillSwitch } from "../src/utils/killswitch.js";
+import { setRateLimitSleepForTests } from "../src/execution/jupiterLimit.js";
 import { sellFraction, scaleRawAmount, usdToTokenRaw, rawToUsd } from "../src/utils/money.js";
 import type { AppConfig, NormalizedAlert } from "../src/types.js";
 import type { EnvConfig } from "../src/config.js";
@@ -51,6 +52,8 @@ class FakeExec implements Executor {
   signed = false;
   failLive = false;
   delayMs = 0;
+  sellErrors: string[] = [];
+  slippage: number[] = [];
   lastSellRaw: string | undefined;
   constructor(private readonly dryOk = true) {}
   ready() {
@@ -72,8 +75,11 @@ class FakeExec implements Executor {
   }
   async sellToken(req: SwapRequest): Promise<SwapResult> {
     this.sells++;
+    this.slippage.push(req.slippageBps);
     this.lastSellRaw = req.sellAmountRaw;
     if (!req.dryRun) this.signed = true;
+    const err = this.sellErrors.shift();
+    if (err) return { ok: false, dryRun: req.dryRun, error: err };
     return {
       ok: true,
       dryRun: req.dryRun,
@@ -246,6 +252,41 @@ describe("safety: claimEvent dedupe + no double buy", () => {
     await engine.closePosition(store.getPosition("dust")!, "mirror", undefined, { fraction: 0.5 });
     assert.equal(fake.sells, 0);
     assert.equal(store.getPosition("dust")?.status, "dry_open");
+    store.close();
+  });
+
+  it("a 429 retries the same sell rung and does not advance the ladder", async () => {
+    setRateLimitSleepForTests(async () => {});
+    const fake = new FakeExec();
+    fake.sellErrors = ["Jupiter /order 429: Too many requests"];
+    const { engine, store } = await setup(path.join(tmpRoot, "rate"), true, fake);
+    store.insertPosition({
+      id: "rate",
+      traderUserId: "uid-1",
+      traderHandle: "alpha",
+      tradeId: null,
+      chain: "solana",
+      tokenAddress: "6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP",
+      tokenSymbol: "TOK",
+      entryUsd: 2,
+      sizeUsd: 2,
+      remainingUsd: 2,
+      quantityRaw: "1000",
+      entryPriceUsd: null,
+      traderSizeAtEntryUsd: 1000,
+      traderTokenAmountAtEntry: null,
+      openedAt: new Date().toISOString(),
+      sourceEventId: "rate",
+      status: "dry_open",
+      isDryRun: true,
+    });
+    try {
+      await engine.closePosition(store.getPosition("rate")!, "stop_loss");
+      assert.deepEqual(fake.slippage.slice(0, 2), [300, 300]);
+      assert.equal(store.getPosition("rate")?.status, "dry_closed");
+    } finally {
+      setRateLimitSleepForTests(null);
+    }
     store.close();
   });
 });

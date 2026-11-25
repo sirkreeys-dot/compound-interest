@@ -12,6 +12,7 @@ import { parseAlert } from "../src/fomo/adapter.js";
 import { TelegramNotifier } from "../src/notify/telegram.js";
 import { Store } from "../src/store/db.js";
 import { KillSwitch } from "../src/utils/killswitch.js";
+import { configureJupiterLimiter } from "../src/execution/jupiterLimit.js";
 import { log, setLogLevel } from "../src/utils/logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -42,6 +43,12 @@ async function main(): Promise<void> {
         : "Replay config: config.example.yaml",
   );
   const cfg = loadAppConfig(configPath, env);
+  configureJupiterLimiter(cfg.risk.jupiterMaxRequestsPerSec);
+  log.info(
+    env.jupiterApiKey
+      ? "Replay Jupiter: API key from the environment (value not logged)"
+      : "Replay Jupiter: no JUPITER_API_KEY set",
+  );
   // Replay uses manual fixture traders (no API key required)
   cfg.traderSource = "manual";
   cfg.traders = [

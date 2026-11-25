@@ -175,6 +175,8 @@ export interface AppConfig {
     maxConsecutiveFailures: number;
     /** Refuse live startup when the wallet holds more than this many SOL. */
     maxWalletSol: number;
+    /** Shared Jupiter request cap. Sells are served before queued buys. */
+    jupiterMaxRequestsPerSec: number;
   };
   quote: {
     solanaNative: string;

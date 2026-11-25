@@ -19,10 +19,12 @@ import type { NormalizedAlert } from "./types.js";
 import { KillSwitch } from "./utils/killswitch.js";
 import { log, setLogLevel } from "./utils/logger.js";
 import { assertHotWalletCeiling } from "./ops/wallet.js";
+import { configureJupiterLimiter } from "./execution/jupiterLimit.js";
 
 async function main(): Promise<void> {
   const env = loadEnv();
   const cfg = loadAppConfig(env.configPath, env);
+  configureJupiterLimiter(cfg.risk.jupiterMaxRequestsPerSec);
   setLogLevel(cfg.logging.level);
   ensureDataDir(env.dataDir);
 

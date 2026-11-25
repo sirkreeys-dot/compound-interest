@@ -119,6 +119,7 @@ const configSchema = z.object({
     solanaProgramAllowlist: z.array(z.string().min(32)).default(DEFAULT_SOLANA_PROGRAM_ALLOWLIST),
     maxConsecutiveFailures: z.number().int().nonnegative().default(3),
     maxWalletSol: z.number().positive().default(1),
+    jupiterMaxRequestsPerSec: z.number().positive().max(10).default(2),
   }),
   quote: z.object({
     solanaNative: z.string(),

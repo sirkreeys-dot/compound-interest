@@ -28,16 +28,18 @@ function sleep(ms: number): Promise<void> {
 export async function fetchRetry(
   input: string | URL,
   init: RequestInit = {},
-  opts: { timeoutMs?: number; retries?: number; fetchImpl?: typeof fetch } = {},
+  opts: { timeoutMs?: number; retries?: number; fetchImpl?: typeof fetch; retry429?: boolean } = {},
 ): Promise<Response> {
   const timeoutMs = opts.timeoutMs ?? HTTP_TIMEOUT_MS;
   const retries = opts.retries ?? 2;
   const fetchImpl = opts.fetchImpl ?? fetch;
+  const retry429 = opts.retry429 !== false;
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetchTimeout(input, init, timeoutMs, fetchImpl);
-      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+      const retryStatus = res.status >= 500 || (retry429 && res.status === 429);
+      if (retryStatus && attempt < retries) {
         await sleep(Math.min(4_000, 200 * 2 ** attempt));
         continue;
       }

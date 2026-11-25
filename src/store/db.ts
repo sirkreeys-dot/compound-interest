@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { DailyStats, OpenPosition } from "../types.js";
+import type { DailyStats, OpenPosition, SkipRecord, TraderStats } from "../types.js";
 
 export class Store {
   private db: DatabaseSync;
@@ -79,11 +79,38 @@ export class Store {
         tx_signature TEXT,
         position_id TEXT,
         error TEXT,
-        notes TEXT
+        notes TEXT,
+        blockhash TEXT,
+        last_valid_block_height INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_swaps(status);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_source_event
         ON positions(source_event_id);
+      CREATE TABLE IF NOT EXISTS skip_reasons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        event_id TEXT,
+        reason TEXT NOT NULL,
+        detail TEXT,
+        trader TEXT,
+        token_address TEXT,
+        side TEXT,
+        is_dry_run INTEGER NOT NULL DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS fill_dedupe (
+        dedupe_key TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sell_retries (
+        position_id TEXT PRIMARY KEY,
+        event_id TEXT,
+        reason TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_error TEXT,
+        next_attempt_at INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        our_fraction REAL
+      );
     `);
     this.migrate();
   }
@@ -98,6 +125,37 @@ export class Store {
     add("trader_size_at_entry_usd", "trader_size_at_entry_usd REAL");
     add("is_dry_run", "is_dry_run INTEGER NOT NULL DEFAULT 0");
     add("trader_token_amount_at_entry", "trader_token_amount_at_entry REAL");
+    add("usd_in", "usd_in REAL");
+    add("usd_out", "usd_out REAL");
+    add("sol_in_lamports", "sol_in_lamports TEXT");
+    add("sol_out_lamports", "sol_out_lamports TEXT");
+    add("fee_lamports", "fee_lamports TEXT");
+    add("rent_paid_lamports", "rent_paid_lamports TEXT");
+    add("rent_reclaimed_lamports", "rent_reclaimed_lamports TEXT");
+    add("peak_mark_usd", "peak_mark_usd REAL");
+    add("tp1_done", "tp1_done INTEGER NOT NULL DEFAULT 0");
+    add("quote_failures", "quote_failures INTEGER NOT NULL DEFAULT 0");
+    const dailyCols = this.db.prepare(`PRAGMA table_info(daily_stats)`).all() as Array<{ name: string }>;
+    if (!dailyCols.some((c) => c.name === "paper_realized_pnl_usd")) {
+      this.db.exec(
+        `ALTER TABLE daily_stats ADD COLUMN paper_realized_pnl_usd REAL NOT NULL DEFAULT 0`,
+      );
+    }
+    const dailyCols2 = this.db.prepare(`PRAGMA table_info(daily_stats)`).all() as Array<{ name: string }>;
+    if (!dailyCols2.some((c) => c.name === "paper_spent_usd")) {
+      this.db.exec(`ALTER TABLE daily_stats ADD COLUMN paper_spent_usd REAL NOT NULL DEFAULT 0`);
+    }
+    const pendingCols = this.db.prepare(`PRAGMA table_info(pending_swaps)`).all() as Array<{ name: string }>;
+    if (!pendingCols.some((c) => c.name === "blockhash")) {
+      this.db.exec(`ALTER TABLE pending_swaps ADD COLUMN blockhash TEXT`);
+    }
+    if (!pendingCols.some((c) => c.name === "last_valid_block_height")) {
+      this.db.exec(`ALTER TABLE pending_swaps ADD COLUMN last_valid_block_height INTEGER`);
+    }
+    const retryCols = this.db.prepare(`PRAGMA table_info(sell_retries)`).all() as Array<{ name: string }>;
+    if (retryCols.length && !retryCols.some((c) => c.name === "our_fraction")) {
+      this.db.exec(`ALTER TABLE sell_retries ADD COLUMN our_fraction REAL`);
+    }
     // Backfill remaining_usd for old rows
     this.db.exec(
       `UPDATE positions SET remaining_usd = size_usd WHERE remaining_usd = 0 AND status IN ('open','dry_open','closing')`,
@@ -154,8 +212,10 @@ export class Store {
           id, trader_user_id, trader_handle, trade_id, chain, token_address, token_symbol,
           entry_usd, size_usd, remaining_usd, quantity_raw, entry_price_usd, trader_size_at_entry_usd,
           trader_token_amount_at_entry, opened_at, source_event_id, status, is_dry_run, closed_at, exit_usd, exit_reason,
-          realized_pnl_usd, tx_entry, tx_exit
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          realized_pnl_usd, tx_entry, tx_exit,
+          usd_in, usd_out, sol_in_lamports, sol_out_lamports, fee_lamports,
+          rent_paid_lamports, rent_reclaimed_lamports, peak_mark_usd, tp1_done, quote_failures
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         p.id,
@@ -182,6 +242,16 @@ export class Store {
         p.realizedPnlUsd ?? null,
         p.txEntry ?? null,
         p.txExit ?? null,
+        p.usdIn ?? null,
+        p.usdOut ?? null,
+        p.solInLamports ?? null,
+        p.solOutLamports ?? null,
+        p.feeLamports ?? null,
+        p.rentPaidLamports ?? null,
+        p.rentReclaimedLamports ?? null,
+        p.peakMarkUsd ?? null,
+        p.trailArmed ? 1 : 0,
+        p.quoteFailures ?? 0,
       );
   }
 
@@ -214,6 +284,55 @@ export class Store {
          AND (trader_user_id = ? OR lower(coalesce(trader_handle,'')) = lower(?)) LIMIT 1`,
       )
       .get(chain, tokenAddress, traderKey, traderKey) as Record<string, unknown> | undefined;
+    return row ? rowToPosition(row) : null;
+  }
+
+  listOpenByTraderToken(
+    traderKey: string,
+    tokenAddress: string,
+    chain: string,
+    opts: { includeDryRun?: boolean } = {},
+  ): OpenPosition[] {
+    const statuses = opts.includeDryRun ? "('open','dry_open')" : "('open')";
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM positions WHERE status IN ${statuses} AND chain = ? AND lower(token_address) = lower(?)
+         AND (trader_user_id = ? OR lower(coalesce(trader_handle,'')) = lower(?))`,
+      )
+      .all(chain, tokenAddress, traderKey, traderKey) as Record<string, unknown>[];
+    return rows.map(rowToPosition);
+  }
+
+  /**
+   * Exact mint, or an exact symbol when it matches one open position.
+   * Substring matches are rejected. Queries shorter than 4 characters are rejected.
+   */
+  findOpenByTokenQuery(query: string, includeDryRun: boolean): OpenPosition[] {
+    const q = query.trim().toLowerCase();
+    if (q.length < 4) return [];
+    const open = this.listOpen({ includeDryRun });
+    const byMint = open.filter((p) => p.tokenAddress.toLowerCase() === q);
+    if (byMint.length) return byMint;
+    const bySymbol = open.filter((p) => (p.tokenSymbol ?? "").toLowerCase() === q);
+    if (bySymbol.length === 1) return bySymbol;
+    return [];
+  }
+
+  tokenExposureUsd(tokenAddress: string, chain: string, liveOnly: boolean): number {
+    const statuses = liveOnly ? "('open')" : "('open','dry_open')";
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(remaining_usd), 0) AS v FROM positions
+         WHERE status IN ${statuses} AND chain = ? AND lower(token_address) = lower(?)`,
+      )
+      .get(chain, tokenAddress) as { v: number };
+    return Number(row.v) || 0;
+  }
+
+  getPosition(id: string): OpenPosition | null {
+    const row = this.db.prepare(`SELECT * FROM positions WHERE id = ?`).get(id) as
+      | Record<string, unknown>
+      | undefined;
     return row ? rowToPosition(row) : null;
   }
 
@@ -284,7 +403,8 @@ export class Store {
     if (opts.fullyClosed) {
       this.db
         .prepare(
-          `UPDATE positions SET status=?, closed_at=?, exit_usd=?, exit_reason=?, realized_pnl_usd=?,
+          `UPDATE positions SET status=?, closed_at=?, exit_usd=?, exit_reason=?,
+           realized_pnl_usd = coalesce(realized_pnl_usd,0) + ?,
            tx_exit=?, quantity_raw=?, remaining_usd=0 WHERE id=?`,
         )
         .run(
@@ -338,11 +458,13 @@ export class Store {
     const row = this.db
       .prepare("SELECT * FROM daily_stats WHERE date = ?")
       .get(date) as Record<string, unknown> | undefined;
-    if (!row) return { date, spentUsd: 0, realizedPnlUsd: 0, trades: 0 };
+    if (!row) return { date, spentUsd: 0, realizedPnlUsd: 0, paperRealizedPnlUsd: 0, paperSpentUsd: 0, trades: 0 };
     return {
       date,
       spentUsd: Number(row.spent_usd),
       realizedPnlUsd: Number(row.realized_pnl_usd),
+      paperRealizedPnlUsd: Number(row.paper_realized_pnl_usd ?? 0),
+      paperSpentUsd: Number(row.paper_spent_usd ?? 0),
       trades: Number(row.trades),
     };
   }
@@ -366,11 +488,59 @@ export class Store {
       .run(date, usd);
   }
 
+  addPaperSpend(usd: number, date = todayUtc()): void {
+    this.db
+      .prepare(
+        `INSERT INTO daily_stats (date, spent_usd, realized_pnl_usd, paper_spent_usd, trades)
+         VALUES (?, 0, 0, ?, 0)
+         ON CONFLICT(date) DO UPDATE SET paper_spent_usd = paper_spent_usd + excluded.paper_spent_usd`,
+      )
+      .run(date, usd);
+  }
+
+  /** DRY_RUN paper PnL. Kept off realized_pnl_usd so it cannot trip the live loss limit. */
+  addPaperRealizedPnl(usd: number, date = todayUtc()): void {
+    this.db
+      .prepare(
+        `INSERT INTO daily_stats (date, spent_usd, realized_pnl_usd, paper_realized_pnl_usd, trades)
+         VALUES (?, 0, 0, ?, 0)
+         ON CONFLICT(date) DO UPDATE SET paper_realized_pnl_usd = paper_realized_pnl_usd + excluded.paper_realized_pnl_usd`,
+      )
+      .run(date, usd);
+  }
+
   getMeta(key: string): string | null {
     const row = this.db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as
       | { value: string }
       | undefined;
     return row?.value ?? null;
+  }
+
+  bumpFlatConfirm(trader: string, mint: string): number {
+    const key = `flat_confirm:${trader.toLowerCase()}:${mint.toLowerCase()}`;
+    const next = Number(this.getMeta(key) ?? "0") + 1;
+    this.setMeta(key, String(next));
+    return next;
+  }
+
+  clearFlatConfirm(trader: string, mint: string): void {
+    const key = `flat_confirm:${trader.toLowerCase()}:${mint.toLowerCase()}`;
+    this.db.prepare(`DELETE FROM meta WHERE key = ?`).run(key);
+  }
+
+  claimFillDedupe(key: string): boolean {
+    const result = this.db
+      .prepare(`INSERT OR IGNORE INTO fill_dedupe (dedupe_key, created_at) VALUES (?, ?)`)
+      .run(key, new Date().toISOString()) as { changes?: number };
+    return (result.changes ?? 0) > 0;
+  }
+
+  noteAlertTs(tsMs: number): void {
+    const prev = this.getMeta("alerts_since");
+    const prevMs = prev ? Date.parse(prev) : 0;
+    if (!Number.isFinite(prevMs) || tsMs > prevMs) {
+      this.setMeta("alerts_since", new Date(tsMs).toISOString());
+    }
   }
 
   setMeta(key: string, value: string): void {
@@ -382,13 +552,359 @@ export class Store {
       .run(key, value);
   }
 
-  lastEntryAt(): number | null {
-    const v = this.getMeta("last_entry_at");
-    return v ? Number(v) : null;
+  /** Per-trader entry cooldown. Pass the trader user id or handle. */
+  lastEntryAt(traderKey?: string | null): number | null {
+    const key = traderKey ? `last_entry_at:${traderKey.toLowerCase()}` : "last_entry_at";
+    const v = this.getMeta(key);
+    if (v) return Number(v);
+    return null;
   }
 
-  setLastEntryAt(ts: number): void {
-    this.setMeta("last_entry_at", String(ts));
+  setLastEntryAt(ts: number, traderKey?: string | null): void {
+    const key = traderKey ? `last_entry_at:${traderKey.toLowerCase()}` : "last_entry_at";
+    this.setMeta(key, String(ts));
+  }
+
+  /**
+   * Positions left in 'closing' go back to open so exits can run again.
+   * Rows with a sent-but-unconfirmed pending swap stay closing so we do not sell twice.
+   */
+  resetStuckClosing(): number {
+    const result = this.db
+      .prepare(
+        `UPDATE positions SET status = CASE WHEN is_dry_run = 1 THEN 'dry_open' ELSE 'open' END
+         WHERE status = 'closing'
+           AND NOT EXISTS (
+             SELECT 1 FROM pending_swaps p
+             WHERE p.status IN ('pending_broadcast','broadcast','confirmed','unresolved','unknown')
+               AND (
+                 p.position_id = positions.id
+                 OR (
+                   p.position_id IS NULL AND p.side = 'sell'
+                   AND lower(p.token_address) = lower(positions.token_address)
+                 )
+               )
+           )`,
+      )
+      .run() as { changes?: number };
+    return result.changes ?? 0;
+  }
+
+  /** Trust the wallet balance over a quoted fill. Scaled remaining USD keeps the next sell sized. */
+  syncPositionToWallet(id: string, quantityRaw: string, remainingUsd: number): void {
+    this.db
+      .prepare(
+        `UPDATE positions
+         SET quantity_raw = ?, remaining_usd = ?,
+             status = CASE WHEN is_dry_run = 1 THEN 'dry_open' ELSE 'open' END
+         WHERE id = ?`,
+      )
+      .run(quantityRaw, remainingUsd, id);
+  }
+
+  setTraderTokenAmount(id: string, amount: number): void {
+    this.db
+      .prepare(`UPDATE positions SET trader_token_amount_at_entry = ? WHERE id = ?`)
+      .run(amount, id);
+  }
+
+  /** Entry snapshot must not overwrite a newer post-sell baseline. */
+  setTraderTokenAmountIfEmpty(id: string, amount: number): void {
+    this.db
+      .prepare(
+        `UPDATE positions SET trader_token_amount_at_entry = ?
+         WHERE id = ? AND trader_token_amount_at_entry IS NULL`,
+      )
+      .run(amount, id);
+  }
+
+  setPeakMark(id: string, markUsd: number | null): void {
+    this.db.prepare(`UPDATE positions SET peak_mark_usd = ? WHERE id = ?`).run(markUsd, id);
+  }
+
+  /**
+   * Arm the trailing stop after the first partial mirrored sell.
+   * Column name tp1_done is historical; it no longer means a fixed take-profit.
+   * Peak is cleared so the next mark seeds the high of the remainder.
+   */
+  setTrailArmed(id: string): void {
+    this.db
+      .prepare(`UPDATE positions SET tp1_done = 1, peak_mark_usd = NULL WHERE id = ?`)
+      .run(id);
+  }
+
+  bumpQuoteFailures(id: string): number {
+    this.db
+      .prepare(
+        `UPDATE positions SET quote_failures = coalesce(quote_failures, 0) + 1 WHERE id = ?`,
+      )
+      .run(id);
+    const row = this.db
+      .prepare(`SELECT quote_failures AS n FROM positions WHERE id = ?`)
+      .get(id) as { n: number } | undefined;
+    return Number(row?.n ?? 0);
+  }
+
+  resetQuoteFailures(id: string): void {
+    this.db.prepare(`UPDATE positions SET quote_failures = 0 WHERE id = ?`).run(id);
+  }
+
+  markWrittenOff(id: string, reason: string): void {
+    this.db
+      .prepare(
+        `UPDATE positions
+         SET status = CASE WHEN is_dry_run = 1 THEN 'dry_written_off' ELSE 'written_off' END,
+             exit_reason = ?, closed_at = ?, remaining_usd = remaining_usd
+         WHERE id = ? AND status IN ('open','dry_open','closing')`,
+      )
+      .run(reason, new Date().toISOString(), id);
+  }
+
+  mergeIntoPosition(
+    id: string,
+    add: {
+      usd: number;
+      raw: string;
+      usdIn?: number | null;
+      solInLamports?: string | null;
+      feeLamports?: string | null;
+      rentPaidLamports?: string | null;
+      traderSizeUsd?: number | null;
+      txEntry?: string | null;
+    },
+  ): void {
+    const cur = this.getPosition(id);
+    if (!cur) return;
+    const nextRaw = (BigInt(cur.quantityRaw ?? "0") + BigInt(add.raw || "0")).toString();
+    const traderSize =
+      add.traderSizeUsd != null && cur.traderSizeAtEntryUsd != null
+        ? cur.traderSizeAtEntryUsd + add.traderSizeUsd
+        : add.traderSizeUsd ?? cur.traderSizeAtEntryUsd;
+    this.db
+      .prepare(
+        `UPDATE positions SET
+           size_usd = size_usd + ?,
+           remaining_usd = remaining_usd + ?,
+           entry_usd = entry_usd + ?,
+           quantity_raw = ?,
+           usd_in = coalesce(usd_in, 0) + ?,
+           sol_in_lamports = ?,
+           fee_lamports = ?,
+           rent_paid_lamports = ?,
+           trader_size_at_entry_usd = ?,
+           tx_entry = coalesce(?, tx_entry)
+         WHERE id = ?`,
+      )
+      .run(
+        add.usd,
+        add.usd,
+        add.usd,
+        nextRaw,
+        add.usdIn ?? add.usd,
+        addLamports(cur.solInLamports, add.solInLamports),
+        addLamports(cur.feeLamports, add.feeLamports),
+        addLamports(cur.rentPaidLamports, add.rentPaidLamports),
+        traderSize,
+        add.txEntry ?? null,
+        id,
+      );
+  }
+
+  addFillEconomics(
+    id: string,
+    add: {
+      usdOutDelta?: number | null;
+      solOutLamports?: string | null;
+      feeLamports?: string | null;
+      rentPaidLamports?: string | null;
+      rentReclaimedLamports?: string | null;
+    },
+  ): void {
+    const cur = this.getPosition(id);
+    if (!cur) return;
+    this.db
+      .prepare(
+        `UPDATE positions SET
+           usd_out = coalesce(usd_out, 0) + ?,
+           sol_out_lamports = ?,
+           fee_lamports = ?,
+           rent_paid_lamports = ?,
+           rent_reclaimed_lamports = ?
+         WHERE id = ?`,
+      )
+      .run(
+        add.usdOutDelta ?? 0,
+        addLamports(cur.solOutLamports, add.solOutLamports),
+        addLamports(cur.feeLamports, add.feeLamports),
+        addLamports(cur.rentPaidLamports, add.rentPaidLamports),
+        addLamports(cur.rentReclaimedLamports, add.rentReclaimedLamports),
+        id,
+      );
+  }
+
+  recordSkip(row: {
+    eventId?: string | null;
+    reason: string;
+    detail?: string | null;
+    trader?: string | null;
+    tokenAddress?: string | null;
+    side?: string | null;
+    isDryRun?: boolean;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO skip_reasons (ts, event_id, reason, detail, trader, token_address, side, is_dry_run)
+         VALUES (?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        new Date().toISOString(),
+        row.eventId ?? null,
+        row.reason,
+        row.detail ?? null,
+        row.trader ?? null,
+        row.tokenAddress ?? null,
+        row.side ?? null,
+        row.isDryRun ? 1 : 0,
+      );
+  }
+
+  listSkips(limit = 50): SkipRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM skip_reasons ORDER BY id DESC LIMIT ?`)
+      .all(limit) as Record<string, unknown>[];
+    return rows.map((r) => ({
+      id: Number(r.id),
+      ts: String(r.ts),
+      eventId: r.event_id != null ? String(r.event_id) : null,
+      reason: String(r.reason),
+      detail: r.detail != null ? String(r.detail) : null,
+      trader: r.trader != null ? String(r.trader) : null,
+      tokenAddress: r.token_address != null ? String(r.token_address) : null,
+      side: r.side != null ? String(r.side) : null,
+      isDryRun: Number(r.is_dry_run) === 1,
+    }));
+  }
+
+  traderRealizedStats(
+    userId: string,
+    handle: string | null,
+    opts: { includeDryRun?: boolean; book?: "live" | "paper" } = {},
+  ): { closes: number; wins: number; realizedPnlUsd: number } {
+    const statuses =
+      opts.book === "paper"
+        ? "('dry_closed')"
+        : opts.book === "live" || !opts.includeDryRun
+          ? "('closed')"
+          : "('closed','dry_closed')";
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS closes,
+                COALESCE(SUM(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(realized_pnl_usd), 0) AS pnl
+         FROM positions
+         WHERE status IN ${statuses}
+           AND (trader_user_id = ? OR lower(coalesce(trader_handle,'')) = lower(?))`,
+      )
+      .get(userId, handle ?? userId) as { closes: number; wins: number; pnl: number };
+    return {
+      closes: Number(row.closes) || 0,
+      wins: Number(row.wins) || 0,
+      realizedPnlUsd: Number(row.pnl) || 0,
+    };
+  }
+
+  listTraderStats(includeDryRun: boolean): TraderStats[] {
+    const statuses = includeDryRun ? "('dry_closed')" : "('closed')";
+    const rows = this.db
+      .prepare(
+        `SELECT trader_user_id AS traderUserId,
+                trader_handle AS traderHandle,
+                COUNT(*) AS closes,
+                COALESCE(SUM(CASE WHEN realized_pnl_usd > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(realized_pnl_usd), 0) AS pnl
+         FROM positions
+         WHERE status IN ${statuses}
+         GROUP BY trader_user_id, trader_handle
+         ORDER BY pnl DESC`,
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map((r) => ({
+      traderUserId: r.traderUserId != null ? String(r.traderUserId) : null,
+      traderHandle: r.traderHandle != null ? String(r.traderHandle) : null,
+      closes: Number(r.closes) || 0,
+      wins: Number(r.wins) || 0,
+      realizedPnlUsd: Number(r.pnl) || 0,
+    }));
+  }
+
+  upsertSellRetry(row: {
+    positionId: string;
+    eventId?: string | null;
+    reason: string;
+    attempts: number;
+    lastError?: string | null;
+    nextAttemptAt: number;
+    ourFraction?: number | null;
+  }): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO sell_retries (
+           position_id, event_id, reason, attempts, last_error, next_attempt_at, created_at, our_fraction
+         ) VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(position_id) DO UPDATE SET
+           event_id = excluded.event_id,
+           reason = excluded.reason,
+           attempts = excluded.attempts,
+           last_error = excluded.last_error,
+           next_attempt_at = excluded.next_attempt_at,
+           our_fraction = excluded.our_fraction`,
+      )
+      .run(
+        row.positionId,
+        row.eventId ?? null,
+        row.reason,
+        row.attempts,
+        row.lastError ?? null,
+        row.nextAttemptAt,
+        now,
+        row.ourFraction ?? null,
+      );
+  }
+
+  getSellRetry(positionId: string): {
+    positionId: string;
+    eventId: string | null;
+    reason: string;
+    attempts: number;
+    lastError: string | null;
+    nextAttemptAt: number;
+    ourFraction: number | null;
+  } | null {
+    const row = this.db
+      .prepare(`SELECT * FROM sell_retries WHERE position_id = ?`)
+      .get(positionId) as Record<string, unknown> | undefined;
+    if (!row) return null;
+    return rowToSellRetry(row);
+  }
+
+  dueSellRetries(nowMs: number): Array<{
+    positionId: string;
+    eventId: string | null;
+    reason: string;
+    attempts: number;
+    lastError: string | null;
+    nextAttemptAt: number;
+    ourFraction: number | null;
+  }> {
+    const rows = this.db
+      .prepare(`SELECT * FROM sell_retries WHERE next_attempt_at <= ? ORDER BY next_attempt_at ASC`)
+      .all(nowMs) as Record<string, unknown>[];
+    return rows.map(rowToSellRetry);
+  }
+
+  deleteSellRetry(positionId: string): void {
+    this.db.prepare(`DELETE FROM sell_retries WHERE position_id = ?`).run(positionId);
   }
 
   loadAlumni(): Array<{
@@ -442,6 +958,7 @@ export class Store {
     inAmountRaw?: string | null;
     expectedOutRaw?: string | null;
     notes?: string | null;
+    positionId?: string | null;
   }): void {
     const now = new Date().toISOString();
     this.db
@@ -450,8 +967,8 @@ export class Store {
           id, created_at, updated_at, status, chain, side, source_event_id,
           trader_user_id, trader_handle, token_address, token_symbol, size_usd,
           sell_token, buy_token, in_amount_raw, expected_out_raw, tx_signature,
-          position_id, error, notes
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          position_id, error, notes, blockhash, last_valid_block_height
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         p.id,
@@ -471,9 +988,11 @@ export class Store {
         p.inAmountRaw ?? null,
         p.expectedOutRaw ?? null,
         null,
-        null,
+        p.positionId ?? null,
         null,
         p.notes ?? null,
+        null,
+        null,
       );
   }
 
@@ -487,6 +1006,8 @@ export class Store {
       notes?: string | null;
       inAmountRaw?: string | null;
       expectedOutRaw?: string | null;
+      blockhash?: string | null;
+      lastValidBlockHeight?: number | null;
     },
   ): void {
     const cur = this.getPendingSwap(id);
@@ -495,7 +1016,8 @@ export class Store {
     this.db
       .prepare(
         `UPDATE pending_swaps SET updated_at=?, status=?, tx_signature=?, position_id=?,
-         error=?, notes=?, in_amount_raw=?, expected_out_raw=? WHERE id=?`,
+         error=?, notes=?, in_amount_raw=?, expected_out_raw=?, blockhash=?,
+         last_valid_block_height=? WHERE id=?`,
       )
       .run(
         now,
@@ -506,6 +1028,8 @@ export class Store {
         patch.notes !== undefined ? patch.notes : cur.notes,
         patch.inAmountRaw !== undefined ? patch.inAmountRaw : cur.inAmountRaw,
         patch.expectedOutRaw !== undefined ? patch.expectedOutRaw : cur.expectedOutRaw,
+        patch.blockhash !== undefined ? patch.blockhash : cur.blockhash,
+        patch.lastValidBlockHeight !== undefined ? patch.lastValidBlockHeight : cur.lastValidBlockHeight,
         id,
       );
   }
@@ -522,7 +1046,7 @@ export class Store {
     const rows = this.db
       .prepare(
         `SELECT * FROM pending_swaps WHERE status IN (
-           'pending_broadcast','broadcast','confirmed','unresolved'
+           'pending_broadcast','broadcast','confirmed','unresolved','unknown'
          ) ORDER BY created_at ASC`,
       )
       .all() as Record<string, unknown>[];
@@ -543,7 +1067,9 @@ export type PendingSwapStatus =
   | "confirmed"
   | "failed"
   | "reconciled"
-  | "unresolved";
+  | "unresolved"
+  | "expired"
+  | "unknown";
 
 export interface PendingSwap {
   id: string;
@@ -566,6 +1092,8 @@ export interface PendingSwap {
   positionId: string | null;
   error: string | null;
   notes: string | null;
+  blockhash: string | null;
+  lastValidBlockHeight: number | null;
 }
 
 
@@ -576,7 +1104,7 @@ function todayUtc(): string {
 function rowToPosition(row: Record<string, unknown>): OpenPosition {
   const sizeUsd = Number(row.size_usd);
   const remaining =
-    row.remaining_usd != null && Number(row.remaining_usd) > 0
+    row.remaining_usd != null && Number.isFinite(Number(row.remaining_usd))
       ? Number(row.remaining_usd)
       : sizeUsd;
   return {
@@ -606,7 +1134,47 @@ function rowToPosition(row: Record<string, unknown>): OpenPosition {
     realizedPnlUsd: row.realized_pnl_usd != null ? Number(row.realized_pnl_usd) : undefined,
     txEntry: row.tx_entry != null ? String(row.tx_entry) : null,
     txExit: row.tx_exit != null ? String(row.tx_exit) : null,
+    usdIn: row.usd_in != null ? Number(row.usd_in) : null,
+    usdOut: row.usd_out != null ? Number(row.usd_out) : null,
+    solInLamports: row.sol_in_lamports != null ? String(row.sol_in_lamports) : null,
+    solOutLamports: row.sol_out_lamports != null ? String(row.sol_out_lamports) : null,
+    feeLamports: row.fee_lamports != null ? String(row.fee_lamports) : null,
+    rentPaidLamports: row.rent_paid_lamports != null ? String(row.rent_paid_lamports) : null,
+    rentReclaimedLamports:
+      row.rent_reclaimed_lamports != null ? String(row.rent_reclaimed_lamports) : null,
+    peakMarkUsd: row.peak_mark_usd != null ? Number(row.peak_mark_usd) : null,
+    trailArmed: Number(row.tp1_done ?? 0) === 1,
+    quoteFailures: row.quote_failures != null ? Number(row.quote_failures) : 0,
   };
+}
+
+function rowToSellRetry(row: Record<string, unknown>): {
+  positionId: string;
+  eventId: string | null;
+  reason: string;
+  attempts: number;
+  lastError: string | null;
+  nextAttemptAt: number;
+  ourFraction: number | null;
+} {
+  return {
+    positionId: String(row.position_id),
+    eventId: row.event_id != null ? String(row.event_id) : null,
+    reason: String(row.reason),
+    attempts: Number(row.attempts),
+    lastError: row.last_error != null ? String(row.last_error) : null,
+    nextAttemptAt: Number(row.next_attempt_at),
+    ourFraction: row.our_fraction != null ? Number(row.our_fraction) : null,
+  };
+}
+
+function addLamports(current: string | null | undefined, delta: string | null | undefined): string | null {
+  if ((delta == null || delta === "") && (current == null || current === "")) return current ?? null;
+  try {
+    return (BigInt(current && current !== "" ? current : "0") + BigInt(delta && delta !== "" ? delta : "0")).toString();
+  } catch {
+    return current ?? null;
+  }
 }
 
 function rowToPending(row: Record<string, unknown>): PendingSwap {
@@ -631,6 +1199,9 @@ function rowToPending(row: Record<string, unknown>): PendingSwap {
     positionId: row.position_id != null ? String(row.position_id) : null,
     error: row.error != null ? String(row.error) : null,
     notes: row.notes != null ? String(row.notes) : null,
+    blockhash: row.blockhash != null ? String(row.blockhash) : null,
+    lastValidBlockHeight:
+      row.last_valid_block_height != null ? Number(row.last_valid_block_height) : null,
   };
 }
 

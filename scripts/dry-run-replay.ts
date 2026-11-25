@@ -21,10 +21,26 @@ async function main(): Promise<void> {
   process.env.DRY_RUN = "true";
   const env = loadEnv();
   env.dryRun = true;
+  log.info(
+    process.env.SOLANA_RPC_URL?.trim()
+      ? "Replay RPC: SOLANA_RPC_URL from the environment (URL not logged)"
+      : "Replay RPC: no SOLANA_RPC_URL set, using the built-in public default",
+  );
 
-  const configPath = fs.existsSync(path.join(root, "config.yaml"))
-    ? path.join(root, "config.yaml")
-    : path.join(root, "config.example.yaml");
+  const explicit = process.env.CONFIG_PATH?.trim();
+  const localYaml = path.join(root, "config.yaml");
+  const configPath = explicit
+    ? path.resolve(explicit)
+    : fs.existsSync(localYaml)
+      ? localYaml
+      : path.join(root, "config.example.yaml");
+  log.info(
+    explicit
+      ? "Replay config: CONFIG_PATH from the environment (path not logged)"
+      : fs.existsSync(localYaml)
+        ? "Replay config: local config.yaml overrides the committed example"
+        : "Replay config: config.example.yaml",
+  );
   const cfg = loadAppConfig(configPath, env);
   // Replay uses manual fixture traders (no API key required)
   cfg.traderSource = "manual";

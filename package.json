@@ -14,23 +14,23 @@
     "kill": "tsx scripts/kill.ts"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.98.4",
-    "bs58": "^6.0.0",
-    "dotenv": "^16.4.7",
-    "js-yaml": "^4.1.0",
-    "viem": "^2.21.0",
-    "ws": "^8.18.0",
-    "zod": "^4.6.7"
+    "@solana/web3.js": "1.99.0",
+    "bs58": "6.0.0",
+    "dotenv": "16.6.1",
+    "js-yaml": "4.3.2",
+    "viem": "2.57.14",
+    "ws": "8.22.1",
+    "zod": "4.6.7"
   },
   "devDependencies": {
-    "@types/js-yaml": "^4.0.9",
-    "@types/node": "^22.10.0",
-    "@types/ws": "^8.5.13",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.2"
+    "@types/js-yaml": "4.0.9",
+    "@types/node": "22.20.5",
+    "@types/ws": "8.18.2",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
   },
   "allowScripts": {
     "esbuild@0.28.2": true

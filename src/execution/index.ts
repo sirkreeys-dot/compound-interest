@@ -4,6 +4,7 @@ import type { AppConfig, ChainName } from "../types.js";
 import { PriceService } from "../utils/prices.js";
 import { BaseExecutor } from "./base.js";
 import { SolanaExecutor } from "./solana.js";
+import { closeEmptyTokenAccount } from "./closeAta.js";
 import type { Executor, SwapRequest, SwapResult } from "./types.js";
 
 export class ExecutionRouter {
@@ -53,6 +54,17 @@ export class ExecutionRouter {
       };
     }
     return ex.sellToken({ ...req, chain });
+  }
+
+  /** Close an empty Solana token account and return reclaimed rent. No-op on other chains. */
+  async reclaimRent(
+    chain: ChainName,
+    mint: string,
+  ): Promise<{ ok: boolean; rentLamports?: number; error?: string }> {
+    if (chain !== "solana" || !this.solana) {
+      return { ok: true, error: "rent reclaim only applies to Solana" };
+    }
+    return this.solana.reclaimRent(mint);
   }
 }
 

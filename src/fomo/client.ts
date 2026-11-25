@@ -1,3 +1,4 @@
+import { fetchRetry } from "../utils/http.js";
 import { log } from "../utils/logger.js";
 import { parseAlertsRestBody } from "./adapter.js";
 import type { NormalizedAlert } from "../types.js";
@@ -32,7 +33,7 @@ export class FomoRestClient {
       if (!path.startsWith("/")) throw new Error("FOMO client: path must start with /");
       url = `${BASE}${path}`;
     }
-    const res = await fetch(url, { headers: this.headers() });
+    const res = await fetchRetry(url, { headers: this.headers() }, { timeoutMs: 10_000, retries: 2 });
     const credits = res.headers.get("x-credits-remaining");
     if (credits) log.debug(`FOMO credits remaining: ${credits}`);
     if (res.status === 401) throw new Error("FOMO API 401 — invalid or missing API key");

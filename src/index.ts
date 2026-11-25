@@ -5,13 +5,17 @@ import {
   loadEnv,
 } from "./config.js";
 import { CopyEngine } from "./engine/copy.js";
+import { shouldPollRest } from "./engine/polling.js";
+import { startPositionReconcileLoop } from "./engine/reconcilePositions.js";
 import { startTpSlLoop } from "./engine/risk.js";
 import { Watchlist } from "./engine/watchlist.js";
 import { ExecutionRouter } from "./execution/index.js";
 import { FomoRestClient } from "./fomo/client.js";
 import { FomoAlertFanout } from "./fomo/ws.js";
 import { TelegramNotifier } from "./notify/telegram.js";
+import { PUBLIC_RPC_HOLDER_WARNING, isPublicSolanaRpc } from "./security/tokenSafety.js";
 import { Store } from "./store/db.js";
+import type { NormalizedAlert } from "./types.js";
 import { KillSwitch } from "./utils/killswitch.js";
 import { log, setLogLevel } from "./utils/logger.js";
 
@@ -77,6 +81,8 @@ async function main(): Promise<void> {
         .listActive()
         .map((t) => t.handle ?? t.userId)
         .join(", ") || "(none)",
+    onCloseToken: (query) => engine.closeToken(query),
+    onWriteoffToken: (query) => engine.writeOffToken(query),
   });
   tg.startCommandPolling();
 
@@ -92,6 +98,13 @@ async function main(): Promise<void> {
   log.info(
     `Enabled chains: solana=${cfg.chains.solana} base=${cfg.chains.base} allowedChains=[${cfg.filters.allowedChains.join(",")}]`,
   );
+  if ((cfg.filters.maxTopHolderBps ?? 0) > 0 && isPublicSolanaRpc(env.solanaRpcUrl)) {
+    log.warn(PUBLIC_RPC_HOLDER_WARNING);
+    if (!env.dryRun) {
+      log.error("Refusing live trading on the public Solana RPC while the top-holder check is on.");
+      process.exit(1);
+    }
+  }
 
   if (!env.fomoApiKey) {
     log.warn("FOMO_API_KEY empty — leaderboard/WS/REST will fail until you set it (see README)");
@@ -119,7 +132,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Reconcile any pending live swaps left from a prior crash
+  // Resolve signed-but-unconfirmed swaps before reopening 'closing' rows.
   try {
     const { reconcilePendingSwaps } = await import("./store/reconcilePending.js");
     await reconcilePendingSwaps({
@@ -133,13 +146,18 @@ async function main(): Promise<void> {
     log.warn("Pending swap reconciliation failed", e);
   }
 
+  const stuck = store.resetStuckClosing();
+  if (stuck > 0) {
+    log.warn(`Reset ${stuck} position(s) stuck in 'closing' back to open so exits can run`);
+  }
+
   const traders = watchlist.subscribeKeysWithOpen(openTraderKeys());
   await tg.notifyBoot(
     `Started. dryRun=${env.dryRun} source=${cfg.traderSource}` +
       (cfg.traderSource === "leaderboard"
         ? ` (${cfg.leaderboard.window} top ${cfg.leaderboard.topN})`
         : "") +
-      ` size=$${cfg.sizing.fixedUsd} paused=${kill.isPaused()} watching: ${traders.join(", ") || "(none)"}. Commands: /status /positions /pause /resume`,
+      ` size=$${cfg.sizing.fixedUsd} paused=${kill.isPaused()} watching: ${traders.join(", ") || "(none)"}. Commands: /status /positions /stats /pause /resume /close /writeoff`,
   );
   // Initial watchlist announcement
   await tg.notifyWatchlistChange({
@@ -174,13 +192,22 @@ async function main(): Promise<void> {
     restTimer = setInterval(() => {
       void (async () => {
         try {
+          if (
+            !shouldPollRest({
+              enabled: cfg.poll.alertsRestEnabled,
+              onlyWhenWsDown: cfg.poll.alertsRestOnlyWhenWsDown,
+              wsHealthy: fanout?.isHealthy() ?? false,
+            })
+          ) {
+            return;
+          }
           const since = store.getMeta("alerts_since") ?? undefined;
           const active = watchlist.listActive();
           const alerts = await rest.alerts({ since, limit: 50, type: "buy" });
           const sells = await rest.alerts({ since, limit: 50, type: "sell" });
-          const all = [...alerts, ...sells];
+          const batch: NormalizedAlert[] = [];
           let maxTs: number | null = null;
-          for (const a of all) {
+          for (const a of [...alerts, ...sells]) {
             const watched =
               watchlist.findActive(a.userId, a.traderHandle) ||
               (a.alertType === "sell"
@@ -192,23 +219,32 @@ async function main(): Promise<void> {
               const key = a.userId ?? a.traderHandle ?? "";
               if (
                 !key ||
-                !store.findOpenByTraderToken(key, a.tokenAddress ?? "", a.chain)
+                !store.findOpenByTraderToken(key, a.tokenAddress ?? "", a.chain, {
+                  includeDryRun: env.dryRun,
+                })
               ) {
                 continue;
               }
             }
-            await engine.handleAlert(a);
+            batch.push(a);
             if (a.ts != null && (maxTs == null || a.ts > maxTs)) maxTs = a.ts;
           }
           void active;
+          if (batch.length) await engine.handleAlerts(batch);
           if (maxTs != null) {
             store.setMeta("alerts_since", new Date(maxTs).toISOString());
           }
         } catch (e) {
-          log.debug("REST alerts poll failed", e);
+          log.warn(
+            `REST alerts poll failed: ${e instanceof Error ? e.message : String(e)}`,
+          );
         }
       })();
     }, cfg.poll.alertsRestIntervalSec * 1000);
+    log.info(
+      `REST alerts every ${cfg.poll.alertsRestIntervalSec}s` +
+        (cfg.poll.alertsRestOnlyWhenWsDown ? " (only while WebSocket is down)" : " (even while WebSocket is up)"),
+    );
   }
 
   const tpSlTimer = startTpSlLoop({
@@ -217,8 +253,33 @@ async function main(): Promise<void> {
     exec,
     dryRun: env.dryRun,
     tg,
-    onTrigger: async (pos, reason) => {
-      await engine.closePosition(pos, reason);
+    onTrigger: async (pos, reason, _mark, fraction) => {
+      await engine.closePosition(pos, reason, undefined, { fraction });
+    },
+  });
+
+  const retryTimer = setInterval(() => {
+    void engine.drainSellRetries().catch((e) => {
+      log.warn(`sell retry drain failed: ${e instanceof Error ? e.message : String(e)}`);
+    });
+  }, 5_000);
+  const pendingTimer = setInterval(() => {
+    void import("./store/reconcilePending.js")
+      .then(({ reconcilePendingSwaps }) =>
+        reconcilePendingSwaps({ store, env, cfg, tg, rpcUrl: env.solanaRpcUrl }),
+      )
+      .catch((e) => {
+        log.warn(`pending recheck failed: ${e instanceof Error ? e.message : String(e)}`);
+      });
+  }, 30_000);
+
+  const reconcile = startPositionReconcileLoop({
+    cfg,
+    store,
+    fomo: rest,
+    includeDryRun: env.dryRun,
+    onFlat: async (pos) => {
+      await engine.closePosition(pos, "reconcile_flat");
     },
   });
 
@@ -229,6 +290,9 @@ async function main(): Promise<void> {
     tg.stop();
     if (restTimer) clearInterval(restTimer);
     clearInterval(tpSlTimer);
+    clearInterval(retryTimer);
+    clearInterval(pendingTimer);
+    reconcile?.stop();
     store.close();
     process.exit(0);
   };
@@ -241,6 +305,7 @@ async function main(): Promise<void> {
   });
   process.on("uncaughtException", (err) => {
     log.error(`Uncaught exception: ${err.message}`);
+    process.exit(1);
   });
 
   log.info(`Config: ${path.resolve(env.configPath)}`);

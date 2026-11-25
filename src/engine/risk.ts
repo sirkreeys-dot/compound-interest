@@ -4,16 +4,20 @@ import type { ExecutionRouter } from "../execution/index.js";
 import type { TelegramNotifier } from "../notify/telegram.js";
 import { log } from "../utils/logger.js";
 import { ZEROX_NATIVE_ETH } from "../utils/money.js";
+import { decideExit, shouldWriteOffQuoteFailures, type ExitReason } from "./exits.js";
 
 export type TpSlHandler = (
   pos: OpenPosition,
-  reason: "take_profit" | "stop_loss",
+  reason: ExitReason,
   markUsd: number,
+  fraction: number,
 ) => Promise<void>;
 
 /**
- * Periodic TP/SL. Mark = sell-quote outUsd, or raw outAmount × fresh native/USDC price.
- * Notifies Telegram when mark still cannot be computed.
+ * Periodic exits: stop-loss, trailing stop once a partial mirror has armed it, max hold.
+ * Mark = sell-quote outUsd, or raw outAmount × fresh native/USDC price.
+ * Quote failures are counted; after quoteFailWriteoffCount the position is written
+ * off and stops counting toward maxOpenPositions.
  */
 export function startTpSlLoop(opts: {
   cfg: AppConfig;
@@ -28,13 +32,13 @@ export function startTpSlLoop(opts: {
   return setInterval(() => {
     if (running) return;
     running = true;
-    void tick(opts).finally(() => {
+    void runTpSlPass(opts).finally(() => {
       running = false;
     });
   }, ms);
 }
 
-async function tick(opts: {
+export async function runTpSlPass(opts: {
   cfg: AppConfig;
   store: Store;
   exec: ExecutionRouter;
@@ -42,9 +46,10 @@ async function tick(opts: {
   onTrigger: TpSlHandler;
   tg?: TelegramNotifier;
 }): Promise<void> {
-  const tp = opts.cfg.risk.takeProfitPct;
   const sl = opts.cfg.risk.stopLossPct;
-  if (tp <= 0 && sl <= 0) return;
+  const trail = opts.cfg.risk.trailingStopPct;
+  const hold = opts.cfg.risk.maxHoldMinutes;
+  if (sl <= 0 && trail <= 0 && hold <= 0) return;
 
   const positions = opts.store.listOpen({ includeDryRun: opts.dryRun });
   for (const pos of positions) {
@@ -61,7 +66,10 @@ async function tick(opts: {
         slippageBps: opts.cfg.risk.maxSlippageBps,
         dryRun: true,
       });
-      if (!quote.ok) continue;
+      if (!quote.ok) {
+        noteQuoteFailure(opts, pos, quote.error ?? "quote failed");
+        continue;
+      }
 
       let markUsd = quote.outUsd ?? null;
       if (markUsd == null && quote.outAmountRaw) {
@@ -79,23 +87,54 @@ async function tick(opts: {
       }
 
       if (markUsd == null) {
+        noteQuoteFailure(opts, pos, "no outUsd from quote/price");
         const sym = (pos.tokenSymbol ?? pos.tokenAddress).replace(/[<>&]/g, "");
         const msg = `TP/SL skip ${sym}: no outUsd from quote/price`;
         log.warn(msg);
-        await opts.tg?.send(`<b>⚠️ TP/SL skipped</b>\n${msg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}`);
+        await opts.tg?.send(
+          `<b>⚠️ TP/SL skipped</b>\n${msg.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}`,
+        );
         continue;
       }
 
-      const pnlPct = ((markUsd - pos.remainingUsd) / pos.remainingUsd) * 100;
-      if (tp > 0 && pnlPct >= tp) {
-        log.info(`TP hit ${pos.tokenSymbol} pnlPct=${pnlPct.toFixed(1)}`);
-        await opts.onTrigger(pos, "take_profit", markUsd);
-      } else if (sl > 0 && pnlPct <= -sl) {
-        log.info(`SL hit ${pos.tokenSymbol} pnlPct=${pnlPct.toFixed(1)}`);
-        await opts.onTrigger(pos, "stop_loss", markUsd);
+      opts.store.resetQuoteFailures(pos.id);
+      const fresh = opts.store.getPosition(pos.id) ?? pos;
+      const decision = decideExit({ pos: fresh, markUsd, cfg: opts.cfg });
+      if (decision.type === "seed_peak") {
+        opts.store.setPeakMark(pos.id, decision.markUsd);
+        continue;
+      }
+      if (decision.type === "close") {
+        log.info(
+          `${decision.reason} ${pos.tokenSymbol} mark=$${markUsd.toFixed(4)} fraction=${decision.fraction}`,
+        );
+        await opts.onTrigger(fresh, decision.reason, markUsd, decision.fraction);
       }
     } catch (e) {
-      log.debug(`TP/SL check failed for ${pos.id}`, e);
+      log.warn(
+        `TP/SL check failed for ${pos.id}: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
+  }
+}
+
+function noteQuoteFailure(
+  opts: { cfg: AppConfig; store: Store; tg?: TelegramNotifier },
+  pos: OpenPosition,
+  detail: string,
+): void {
+  const n = opts.store.bumpQuoteFailures(pos.id);
+  const limit = opts.cfg.risk.quoteFailWriteoffCount;
+  log.warn(
+    `TP/SL quote failed for ${pos.tokenSymbol ?? pos.id} (${n}/${limit}): ${detail}`,
+  );
+  if (shouldWriteOffQuoteFailures(n, limit)) {
+    opts.store.markWrittenOff(pos.id, `quote_failures:${n}`);
+    log.warn(
+      `Wrote off ${pos.tokenSymbol ?? pos.tokenAddress} after ${n} failed price fetches — no longer counts toward maxOpenPositions`,
+    );
+    void opts.tg?.send(
+      `<b>Position written off</b>\n${pos.tokenSymbol ?? "?"} <code>${pos.tokenAddress}</code>\n${n} price fetches failed. Tokens may still be in the wallet. It no longer counts toward maxOpenPositions.`,
+    );
   }
 }

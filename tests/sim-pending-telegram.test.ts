@@ -270,14 +270,15 @@ describe("pending ledger + reconcile", () => {
       getSignatureStatuses: async () => [
         { confirmationStatus: "finalized", err: null },
       ],
+      getWalletTokenAmount: async () => "100",
     });
-    // abandoned resolved as failed; need-recover resolved into position
-    assert.ok(result.resolved >= 1);
-    assert.equal(store.getPendingSwap("abandoned")!.status, "failed");
+    assert.equal(store.getPendingSwap("abandoned")!.status, "unresolved");
+    assert.match(store.getPendingSwap("abandoned")!.error ?? "", /not proven safe/);
     assert.equal(store.getPendingSwap("need-recover")!.status, "reconciled");
     const opens = store.listOpen();
     assert.equal(opens.length, 1);
-    assert.equal(opens[0]!.quantityRaw, "4242");
+    assert.equal(opens[0]!.quantityRaw, "100");
+    assert.ok(result.resolved >= 1);
     store.close();
   });
 });
@@ -323,7 +324,7 @@ describe("telegram TELEGRAM_ALLOWED_USER_IDS lock", () => {
           result: [
             {
               update_id: 2,
-              edited_message: {
+              message: {
                 chat: { id: 111 },
                 from: { id: 999 },
                 text: "/pause",
@@ -339,7 +340,7 @@ describe("telegram TELEGRAM_ALLOWED_USER_IDS lock", () => {
     store.close();
   });
 
-  it("when allow-list empty, chat id alone still authorizes (back-compat)", async () => {
+  it("when allow-list empty, commands are refused", async () => {
     const dir = path.join(tmp, "tg-compat");
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
@@ -365,7 +366,8 @@ describe("telegram TELEGRAM_ALLOWED_USER_IDS lock", () => {
         { status: 200 },
       )) as typeof fetch;
     await tg.pollUpdatesForTests();
-    assert.equal(kill.isPaused(), true);
+    assert.equal(kill.isPaused(), false);
+    assert.equal(tg.commandsEnabled, false);
     globalThis.fetch = original;
     store.close();
   });

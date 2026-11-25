@@ -14,11 +14,15 @@ export interface SwapRequest {
   dryRun: boolean;
   /** Live buys: pending_swaps row id written before broadcast. */
   pendingId?: string;
+  /** Open position this sell belongs to, so crash recovery can update that row. */
+  positionId?: string;
   /** Live buys: FOMO event id for ledger. */
   sourceEventId?: string;
   traderUserId?: string | null;
   traderHandle?: string | null;
   tokenSymbol?: string | null;
+  /** Called immediately before tx.sign. Throw to refuse the signature. */
+  beforeSign?: () => void | Promise<void>;
 }
 
 export interface SwapResult {
@@ -36,6 +40,18 @@ export interface SwapResult {
   quoteSummary?: string;
   /** Echo pending ledger id when used. */
   pendingId?: string;
+  /** Quote or fill USD value of the sold side, when the venue reports it. */
+  inUsd?: number;
+  /** Signature + priority fees in lamports, when reported. */
+  feeLamports?: number;
+  /** ATA rent charged on the fill, in lamports, when reported. */
+  rentLamports?: number;
+  /** Lamports of SOL actually spent (native-SOL input only). */
+  solInLamports?: string;
+  /** Lamports of SOL actually received (native-SOL output only). */
+  solOutLamports?: string;
+  /** Previous signature is not confirmed failed. Do not sign another transaction. */
+  inFlight?: boolean;
 }
 
 export interface Executor {

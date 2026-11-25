@@ -6,6 +6,7 @@
  * Jupiter: GET https://api.jup.ag/price/v3?ids=<mint> → { [mint]: { usdPrice, blockId, decimals } }
  * 0x: GET https://api.0x.org/swap/allowance-holder/price?chainId=8453&sellToken=0xEeee…&buyToken=USDC&sellAmount=1e18
  */
+import { fetchRetry } from "./http.js";
 import { log } from "./logger.js";
 import { ZEROX_NATIVE_ETH } from "./money.js";
 
@@ -33,6 +34,8 @@ export interface PriceServiceOpts {
   maxAgeMs?: number;
   /** Max age for CoinGecko fallback (ms). Default 15s — tighter. */
   coingeckoMaxAgeMs?: number;
+  /** Max Jupiter-vs-CoinGecko divergence in bps. Default 250. */
+  divergenceBps?: number;
   now?: () => number;
   fetchImpl?: typeof fetch;
 }
@@ -45,45 +48,50 @@ export class PriceService {
   private readonly fetchImpl: typeof fetch;
   private readonly jupiterApiKey: string;
   private readonly zeroXApiKey: string;
+  private readonly divergenceBps: number;
 
   constructor(opts: PriceServiceOpts = {}) {
     this.maxAgeMs = opts.maxAgeMs ?? 30_000;
     this.cgMaxAgeMs = opts.coingeckoMaxAgeMs ?? 15_000;
+    this.divergenceBps = opts.divergenceBps ?? 250;
     this.now = opts.now ?? (() => Date.now());
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.jupiterApiKey = opts.jupiterApiKey ?? "";
     this.zeroXApiKey = opts.zeroXApiKey ?? "";
   }
 
-  /** SOL USD — Jupiter Price v3, then /order USDC→SOL cross-check, then guarded CoinGecko. */
+  /** SOL USD from Jupiter, accepted only when CoinGecko agrees within divergenceBps. */
   async getSolUsd(): Promise<FreshPrice> {
     const cached = this.getFreshCached("sol", this.maxAgeMs);
     if (cached && cached.source !== "coingecko_fallback") return cached;
 
+    let primary: FreshPrice | null = null;
     try {
       const p = await this.fetchJupiterPriceV3(SOL_MINT);
-      if (p && inBounds(p.usd, SOL_SANITY)) {
-        const fresh = { ...p, source: "jupiter_v3" as const };
-        this.cache.set("sol", fresh);
-        return fresh;
-      }
+      if (p && inBounds(p.usd, SOL_SANITY)) primary = { ...p, source: "jupiter_v3" };
     } catch (e) {
       log.debug("Jupiter price v3 SOL failed", e);
     }
-
-    try {
-      const p = await this.fetchSolViaJupiterOrder();
-      if (p && inBounds(p.usd, SOL_SANITY)) {
-        this.cache.set("sol", p);
-        return p;
+    if (!primary) {
+      try {
+        const p = await this.fetchSolViaJupiterOrder();
+        if (p && inBounds(p.usd, SOL_SANITY)) primary = p;
+      } catch (e) {
+        log.debug("Jupiter order SOL price failed", e);
       }
-    } catch (e) {
-      log.debug("Jupiter order SOL price failed", e);
     }
-
-    const cg = await this.fetchCoinGecko("solana", "sol", SOL_SANITY);
-    if (cg) return cg;
-    throw new Error("No fresh SOL/USD price (Jupiter + CoinGecko failed or out of bounds)");
+    const cg = await this.fetchCoinGecko("solana", "sol-cg", SOL_SANITY);
+    if (!primary || !cg) {
+      throw new Error("SOL price cross-check failed (need Jupiter and CoinGecko)");
+    }
+    const bps = (Math.abs(primary.usd - cg.usd) / primary.usd) * 10_000;
+    if (bps > this.divergenceBps) {
+      throw new Error(
+        `SOL price divergence ${Math.round(bps)}bps > ${this.divergenceBps}bps (jupiter=${primary.usd} coingecko=${cg.usd})`,
+      );
+    }
+    this.cache.set("sol", primary);
+    return primary;
   }
 
   /** ETH USD on Base — 0x price (1 ETH → USDC), then guarded CoinGecko. */
@@ -153,6 +161,10 @@ export class PriceService {
     return null;
   }
 
+  private http(url: string, init?: RequestInit): Promise<Response> {
+    return fetchRetry(url, init ?? {}, { timeoutMs: 10_000, retries: 2, fetchImpl: this.fetchImpl });
+  }
+
   private getFreshCached(key: string, maxAge: number): FreshPrice | null {
     const c = this.cache.get(key);
     if (!c) return null;
@@ -163,7 +175,7 @@ export class PriceService {
   private async fetchJupiterPriceV3(mint: string): Promise<FreshPrice | null> {
     const headers: Record<string, string> = {};
     if (this.jupiterApiKey) headers["x-api-key"] = this.jupiterApiKey;
-    const res = await this.fetchImpl(`https://api.jup.ag/price/v3?ids=${mint}`, { headers });
+    const res = await this.http(`https://api.jup.ag/price/v3?ids=${mint}`, { headers });
     if (!res.ok) return null;
     const body = (await res.json()) as Record<
       string,
@@ -188,7 +200,7 @@ export class PriceService {
       outputMint: USDC_SOL,
       amount: "1000000000", // 1 SOL
     });
-    const res = await this.fetchImpl(`https://api.jup.ag/swap/v2/order?${params}`, { headers });
+    const res = await this.http(`https://api.jup.ag/swap/v2/order?${params}`, { headers });
     if (!res.ok) return null;
     const order = (await res.json()) as {
       outAmount?: string;
@@ -221,7 +233,7 @@ export class PriceService {
       buyToken: USDC_BASE,
       sellAmount: "1000000000000000000", // 1 ETH
     });
-    const res = await this.fetchImpl(
+    const res = await this.http(
       `https://api.0x.org/swap/allowance-holder/price?${params}`,
       {
         headers: {
@@ -246,7 +258,7 @@ export class PriceService {
     const cached = this.getFreshCached(cacheKey, this.cgMaxAgeMs);
     if (cached && cached.source === "coingecko_fallback") return cached;
 
-    const res = await this.fetchImpl(
+    const res = await this.http(
       `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`,
     );
     if (!res.ok) return null;

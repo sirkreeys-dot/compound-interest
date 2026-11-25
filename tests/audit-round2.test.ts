@@ -206,8 +206,8 @@ describe("audit-r2: sell fraction ignores cumulative sold/bought without entry s
     };
     const r = await resolveSellFraction({ pos, fomo: fomo as never });
     assert.notEqual(r.method, "fomo_sold_vs_bought");
-    // Without reliable fraction → full exit fallback
-    assert.equal(r.method, "full_exit_fallback");
-    assert.equal(r.fraction, 1);
+    // Lifetime sold/bought is not a fraction. Without an entry snapshot this is undetermined.
+    assert.equal(r.method, "unknown");
+    assert.equal(r.fraction, null);
   });
 });

@@ -4,6 +4,7 @@
  * Env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
  * Commands (restricted to TELEGRAM_CHAT_ID): /status /positions /pause /resume /help
  */
+import { fetchRetry } from "../utils/http.js";
 import { log } from "../utils/logger.js";
 import type { KillSwitch } from "../utils/killswitch.js";
 import type { Store } from "../store/db.js";
@@ -20,6 +21,10 @@ export interface TelegramDeps {
   dryRun: boolean;
   getWsStatus: () => string;
   getWatchlistSummary?: () => string;
+  /** Authorized /close. Returns a user-facing summary. */
+  onCloseToken?: (query: string) => Promise<string>;
+  /** Authorized /writeoff. Returns a user-facing summary. */
+  onWriteoffToken?: (query: string) => Promise<string>;
 }
 
 export class TelegramNotifier {
@@ -31,12 +36,20 @@ export class TelegramNotifier {
   private pollTimer: NodeJS.Timeout | null = null;
   private deps: Omit<TelegramDeps, "token" | "chatId"> | null = null;
   readonly enabled: boolean;
+  /** Commands require TELEGRAM_ALLOWED_USER_IDS. Empty allowlist disables them. */
+  readonly commandsEnabled: boolean;
 
   constructor(token: string, chatId: string, allowedUserIds: string[] = []) {
     this.token = token;
     this.chatId = chatId;
     this.allowedUserIds = new Set(allowedUserIds.map((s) => String(s).trim()).filter(Boolean));
     this.enabled = Boolean(token && chatId);
+    this.commandsEnabled = this.enabled && this.allowedUserIds.size > 0;
+    if (this.enabled && !this.commandsEnabled) {
+      log.warn(
+        "Telegram commands disabled — set TELEGRAM_ALLOWED_USER_IDS. Chat id alone is not enough for /close, /writeoff, /pause, or /resume.",
+      );
+    }
     if (!this.enabled) {
       log.warn(
         "Telegram disabled — set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID for notifications and commands",
@@ -50,7 +63,7 @@ export class TelegramNotifier {
   }
 
   startCommandPolling(): void {
-    if (!this.enabled) return;
+    if (!this.commandsEnabled) return;
     const tick = async () => {
       try {
         await this.pollUpdates();
@@ -60,7 +73,7 @@ export class TelegramNotifier {
     };
     void tick();
     this.pollTimer = setInterval(() => void tick(), 2500);
-    log.info("Telegram command polling started (/status /positions /pause /resume)");
+    log.info("Telegram command polling started (/status /positions /stats /pause /resume /close /writeoff)");
   }
 
   stop(): void {
@@ -74,7 +87,7 @@ export class TelegramNotifier {
       return;
     }
     try {
-      const res = await fetch(`${API}/bot${this.token}/sendMessage`, {
+      const res = await fetchRetry(`${API}/bot${this.token}/sendMessage`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -216,7 +229,7 @@ export class TelegramNotifier {
   private async pollUpdates(): Promise<void> {
     // Token is required by Telegram HTTP API path design; never log this URL.
     const url = `${API}/bot${this.token}/getUpdates?timeout=0&offset=${this.offset}&allowed_updates=${encodeURIComponent(JSON.stringify(["message", "edited_message"]))}`;
-    const res = await fetch(url);
+    const res = await fetchRetry(url, {}, { timeoutMs: 10_000, retries: 2 });
     if (!res.ok) return;
     const data = (await res.json()) as {
       ok?: boolean;
@@ -234,11 +247,16 @@ export class TelegramNotifier {
         };
       }>;
     };
+    if (!this.commandsEnabled) return;
     if (!data.ok || !data.result) return;
     const expected = String(this.chatId).trim();
     for (const u of data.result) {
       this.offset = u.update_id + 1;
-      const msg = u.message ?? u.edited_message;
+      if (u.edited_message && !u.message) {
+        log.warn("Ignored Telegram command from edited_message");
+        continue;
+      }
+      const msg = u.message;
       const chatId = msg?.chat?.id;
       const fromId = msg?.from?.id;
       const text = msg?.text?.trim() ?? "";
@@ -253,22 +271,18 @@ export class TelegramNotifier {
         log.warn(`Ignored Telegram command from unauthorized chat`);
         continue;
       }
-      // Optional sender lock (group-safe): when TELEGRAM_ALLOWED_USER_IDS is set
-      if (this.allowedUserIds.size > 0) {
-        if (fromId === undefined || fromId === null) {
-          log.warn("Ignored Telegram command with missing from.id (allowed-user lock)");
-          continue;
-        }
-        if (!this.allowedUserIds.has(String(fromId).trim())) {
-          log.warn(`Ignored Telegram command from unauthorized user id`);
-          continue;
-        }
+      if (fromId === undefined || fromId === null || !this.allowedUserIds.has(String(fromId).trim())) {
+        log.warn("Ignored Telegram command from unauthorized user id");
+        continue;
       }
-      await this.handleCommand(text.split(/\s+/)[0]!.split("@")[0]!);
+      const parts = text.split(/\s+/);
+      const cmd = parts[0]!.split("@")[0]!;
+      const arg = parts.slice(1).join(" ").trim();
+      await this.handleCommand(cmd, arg);
     }
   }
 
-  private async handleCommand(cmd: string): Promise<void> {
+  private async handleCommand(cmd: string, arg = ""): Promise<void> {
     const d = this.deps;
     if (!d) {
       await this.send("Bot internals not attached yet.");
@@ -281,8 +295,11 @@ export class TelegramNotifier {
             "<b>Commands</b> (this chat only)",
             "/status — mode, pause, positions, daily spend, WS",
             "/positions — open positions",
+            "/stats — per-trader win rate and realized PnL",
             "/pause — kill switch ON (block new entries)",
             "/resume — kill switch OFF",
+            "/close &lt;token&gt; — sell that open position now",
+            "/writeoff &lt;token&gt; — drop a position without selling",
             "/help — this message",
           ].join("\n"),
         );
@@ -303,7 +320,10 @@ export class TelegramNotifier {
             `Size: $${d.cfg.sizing.fixedUsd} fixed (max $${d.cfg.sizing.maxUsdPerTrade})`,
             `Open positions: ${open.length} / ${d.cfg.risk.maxOpenPositions}`,
             `Today spent: $${daily.spentUsd.toFixed(2)} / $${d.cfg.risk.dailyBudgetUsd}`,
-            `Today realized PnL: $${daily.realizedPnlUsd.toFixed(2)}`,
+            `Today realized PnL: $${(d.dryRun ? daily.paperRealizedPnlUsd : daily.realizedPnlUsd).toFixed(2)}` +
+              (d.cfg.risk.dailyLossLimitUsd > 0
+                ? ` (loss limit $${d.cfg.risk.dailyLossLimitUsd}, resets 00:00 UTC)`
+                : " (resets 00:00 UTC)"),
             `Today trades: ${daily.trades}`,
             `Watching: ${esc(watching)}`,
           ].join("\n"),
@@ -331,6 +351,55 @@ export class TelegramNotifier {
         d.kill.resume();
         await this.send("▶️ Kill switch OFF — entries allowed again.");
         break;
+      case "/stats": {
+        const rows = d.store.listTraderStats(d.dryRun);
+        if (!rows.length) {
+          await this.send(
+            d.dryRun
+              ? "No closed paper trades yet."
+              : "No closed live trades yet.",
+          );
+          break;
+        }
+        const lines = rows.map((r) => {
+          const name = r.traderHandle ?? r.traderUserId ?? "?";
+          const rate = r.closes > 0 ? Math.round((r.wins / r.closes) * 100) : 0;
+          return `${esc(name)}: ${r.wins}/${r.closes} wins (${rate}%) PnL ${r.realizedPnlUsd >= 0 ? "+" : ""}$${r.realizedPnlUsd.toFixed(2)}`;
+        });
+        const total = rows.reduce((s, r) => s + r.realizedPnlUsd, 0);
+        await this.send(
+          [`<b>Stats ${d.dryRun ? "(paper)" : "(live)"}</b>`, ...lines, `Total realized: ${total >= 0 ? "+" : ""}$${total.toFixed(2)}`].join(
+            "\n",
+          ),
+        );
+        break;
+      }
+      case "/close": {
+        if (!arg) {
+          await this.send("Usage: /close &lt;symbol or mint&gt;");
+          break;
+        }
+        if (!d.onCloseToken) {
+          await this.send("Close is not wired.");
+          break;
+        }
+        const msg = await d.onCloseToken(arg);
+        await this.send(esc(msg));
+        break;
+      }
+      case "/writeoff": {
+        if (!arg) {
+          await this.send("Usage: /writeoff &lt;symbol or mint&gt;");
+          break;
+        }
+        if (!d.onWriteoffToken) {
+          await this.send("Writeoff is not wired.");
+          break;
+        }
+        const msg = await d.onWriteoffToken(arg);
+        await this.send(esc(msg));
+        break;
+      }
       default:
         await this.send(`Unknown command ${esc(cmd)}. Try /help`);
     }

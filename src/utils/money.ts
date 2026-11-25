@@ -29,8 +29,9 @@ export function sellFraction(opts: {
   traderSizeAtEntryUsd: number | null;
 }): number {
   const { traderSellUsd, traderSizeAtEntryUsd } = opts;
-  if (traderSellUsd == null || traderSellUsd <= 0) return 1; // unknown → full exit
-  if (traderSizeAtEntryUsd == null || traderSizeAtEntryUsd <= 0) return 1;
+  // Unknown size is a partial, matching mapTraderSellToOurFraction. The engine does not call this.
+  if (traderSellUsd == null || traderSellUsd <= 0) return 0.5;
+  if (traderSizeAtEntryUsd == null || traderSizeAtEntryUsd <= 0) return 0.5;
   return Math.min(1, traderSellUsd / traderSizeAtEntryUsd);
 }
 

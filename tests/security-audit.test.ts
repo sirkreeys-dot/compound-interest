@@ -275,7 +275,7 @@ describe("security: Telegram HTML escape + auth", () => {
     const dir = path.join(tmp, "tg-edit");
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
-    const tg = new TelegramNotifier("token", "111");
+    const tg = new TelegramNotifier("token", "111", ["5"]);
     const kill = new KillSwitch(path.join(dir, "kill.switch"));
     const cfg = loadAppConfig(path.join(root, "config.example.yaml"));
     cfg.traderSource = "manual";
@@ -294,7 +294,7 @@ describe("security: Telegram HTML escape + auth", () => {
             result: [
               {
                 update_id: 10,
-                edited_message: { chat: { id: 999 }, text: "/pause" },
+                edited_message: { chat: { id: 999 }, from: { id: 5 }, text: "/pause" },
               },
             ],
           }),
@@ -308,7 +308,7 @@ describe("security: Telegram HTML escape + auth", () => {
           result: [
             {
               update_id: 11,
-              edited_message: { chat: { id: 111 }, text: "/pause" },
+              edited_message: { chat: { id: 111 }, from: { id: 5 }, text: "/pause" },
             },
           ],
         }),
@@ -319,7 +319,7 @@ describe("security: Telegram HTML escape + auth", () => {
     await tg.pollUpdatesForTests();
     assert.equal(kill.isPaused(), false);
     await tg.pollUpdatesForTests();
-    assert.equal(kill.isPaused(), true);
+    assert.equal(kill.isPaused(), false);
     globalThis.fetch = original;
     store.close();
   });
@@ -328,7 +328,7 @@ describe("security: Telegram HTML escape + auth", () => {
     const dir = path.join(tmp, "tg-num");
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
-    const tg = new TelegramNotifier("token", "222"); // string
+    const tg = new TelegramNotifier("token", "222", ["7"]);
     const kill = new KillSwitch(path.join(dir, "kill.switch"));
     const cfg = loadAppConfig(path.join(root, "config.example.yaml"));
     cfg.traderSource = "manual";
@@ -340,7 +340,7 @@ describe("security: Telegram HTML escape + auth", () => {
       new Response(
         JSON.stringify({
           ok: true,
-          result: [{ update_id: 1, message: { chat: { id: 222 }, text: "/pause" } }],
+          result: [{ update_id: 1, message: { chat: { id: 222 }, from: { id: 7 }, text: "/pause" } }],
         }),
         { status: 200 },
       )) as typeof fetch;

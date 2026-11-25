@@ -1,11 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
 import yaml from "js-yaml";
 import { z } from "zod";
 import { OVERHEAD_HARD_CAP_LAMPORTS } from "./security/overhead.js";
 import { DEFAULT_SOLANA_PROGRAM_ALLOWLIST } from "./security/programAllowlist.js";
 import type { AppConfig, LeaderboardWindow, TraderSource } from "./types.js";
+import { log } from "./utils/logger.js";
 
 dotenv.config();
 
@@ -238,12 +240,82 @@ export function loadEnv(): EnvConfig {
   };
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Arrays and scalars from the overlay replace the base. Missing keys stay on the base. */
+export function deepMergeConfig(base: unknown, overlay: unknown): unknown {
+  if (Array.isArray(overlay)) return overlay.slice();
+  if (isPlainObject(base) && isPlainObject(overlay)) {
+    const out: Record<string, unknown> = { ...base };
+    for (const [key, value] of Object.entries(overlay)) {
+      if (value === undefined) continue;
+      out[key] = key in base ? deepMergeConfig(base[key], value) : value;
+    }
+    return out;
+  }
+  return overlay;
+}
+
+export function exampleConfigPath(): string {
+  const candidates = [
+    path.resolve("config.example.yaml"),
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "config.example.yaml"),
+    path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "config.example.yaml"),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  throw new Error("config.example.yaml not found");
+}
+
+/**
+ * Settings weaker than the committed rules. A smaller trade size is not weaker.
+ * Stricter liquidity, holder, round-trip, or stop-loss values are not weaker.
+ */
+export function weakenedSafetySettings(cfg: AppConfig): string[] {
+  const weakened: string[] = [];
+  if (cfg.filters.minLiquidityUsd < 10_000) {
+    weakened.push(`minLiquidityUsd ${cfg.filters.minLiquidityUsd} < 10000`);
+  }
+  if (!(cfg.filters.maxTopHolderBps > 0) || cfg.filters.maxTopHolderBps > 9000) {
+    weakened.push(`maxTopHolderBps ${cfg.filters.maxTopHolderBps} outside 1..9000`);
+  }
+  if (!(cfg.filters.roundTripMaxLossBps > 0) || cfg.filters.roundTripMaxLossBps > 2500) {
+    weakened.push(`roundTripMaxLossBps ${cfg.filters.roundTripMaxLossBps} outside 1..2500`);
+  }
+  if (cfg.filters.tokenSafety !== "block") {
+    weakened.push(`tokenSafety ${cfg.filters.tokenSafety} is not block`);
+  }
+  if (!cfg.filters.blockMintAuthority) weakened.push("blockMintAuthority is off");
+  if (!cfg.filters.blockFreezeAuthority) weakened.push("blockFreezeAuthority is off");
+  if (!cfg.risk.simulateBeforeSign) weakened.push("simulateBeforeSign is off");
+  if (cfg.risk.simMaxOverheadLamports < 1 || cfg.risk.simMaxOverheadLamports > 10_000_000) {
+    weakened.push(`simMaxOverheadLamports ${cfg.risk.simMaxOverheadLamports} outside 1..10000000`);
+  }
+  if (!(cfg.risk.stopLossPct > 0) || cfg.risk.stopLossPct > 25) {
+    weakened.push(`stopLossPct ${cfg.risk.stopLossPct} outside 1..25`);
+  }
+  if (cfg.sizing.maxUsdPerTrade > 5) {
+    weakened.push(`maxUsdPerTrade ${cfg.sizing.maxUsdPerTrade} > 5`);
+  }
+  if (cfg.risk.dailyBudgetUsd > 40) {
+    weakened.push(`dailyBudgetUsd ${cfg.risk.dailyBudgetUsd} > 40`);
+  }
+  return weakened;
+}
+
 export function loadAppConfig(configPath: string, env?: EnvConfig): AppConfig {
   const abs = path.resolve(configPath);
   if (!fs.existsSync(abs)) {
     throw new Error(`Config not found: ${abs}. Copy config.example.yaml to config.yaml`);
   }
-  const raw = yaml.load(fs.readFileSync(abs, "utf8"));
+  const examplePath = exampleConfigPath();
+  const overlay = yaml.load(fs.readFileSync(abs, "utf8"));
+  const base = yaml.load(fs.readFileSync(examplePath, "utf8"));
+  const raw =
+    path.resolve(examplePath) === abs ? overlay : deepMergeConfig(base, overlay);
   const parsed = configSchema.parse(raw) as AppConfig;
 
   // Env overrides (TRADER_SOURCE, LEADERBOARD_*)
@@ -270,6 +342,15 @@ export function loadAppConfig(configPath: string, env?: EnvConfig): AppConfig {
         throw new Error("Each manual trader needs handle and/or userId");
       }
     }
+  }
+
+  const weakened = weakenedSafetySettings(parsed);
+  if (weakened.length) {
+    const detail = weakened.join("; ");
+    if (env?.dryRun === false) {
+      throw new Error(`LIVE refused: safety settings weaker than the committed floor: ${detail}`);
+    }
+    log.warn(`DRY_RUN safety settings weaker than the committed floor: ${detail}`);
   }
 
   return parsed;

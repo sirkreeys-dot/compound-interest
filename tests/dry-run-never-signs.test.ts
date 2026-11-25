@@ -138,23 +138,84 @@ describe("dry-run never signs or sends", () => {
       watchlist,
     );
     try {
+      const refused = await exec.buy("solana", {
+        sellToken: SOL,
+        buyToken: MINT,
+        sellUsd: 2,
+        slippageBps: 300,
+        dryRun: true,
+      });
+      assert.equal(refused.ok, false);
+      assert.match(refused.error ?? "", /token_safety: inspect_failed/);
+      assert.match(refused.error ?? "", /mint inspection unavailable \(fail closed\)/);
       await engine.handleAlert(alert({ eventId: "buy-1", tradeId: "buy-1" }));
-      const open = store.listOpen({ includeDryRun: true });
-      assert.equal(open.length, 1);
-      assert.equal(open[0]!.isDryRun, true);
-      assert.equal(store.getDaily().spentUsd, 0);
-      assert.ok(store.getDaily().paperSpentUsd > 0);
+      assert.equal(store.listOpen({ includeDryRun: true }).length, 0);
+      store.insertPosition({
+        id: "paper-1",
+        traderUserId: "uid-1",
+        traderHandle: "alpha",
+        tradeId: "buy-1",
+        chain: "solana",
+        tokenAddress: MINT,
+        tokenSymbol: "TOK",
+        entryUsd: 2,
+        sizeUsd: 2,
+        remainingUsd: 2,
+        quantityRaw: "1000",
+        entryPriceUsd: null,
+        traderSizeAtEntryUsd: 1000,
+        traderTokenAmountAtEntry: null,
+        openedAt: new Date().toISOString(),
+        sourceEventId: "buy-1",
+        status: "dry_open",
+        isDryRun: true,
+      });
       await engine.handleAlert(
         alert({ eventId: "sell-1", tradeId: "sell-1", alertType: "sell", tradeUsd: 1000 }),
       );
-      const afterSell = store.getPosition(open[0]!.id);
-      assert.ok(afterSell);
-      assert.notEqual(afterSell!.status, "closed");
-      await engine.closePosition(afterSell!, "stop_loss");
-      assert.equal(store.getPosition(open[0]!.id)?.status, "dry_closed");
-      await engine.handleAlert(alert({ eventId: "buy-2", tradeId: "buy-2" }));
-      const again = store.listOpen({ includeDryRun: true });
-      assert.equal(again.length, 1);
+      assert.equal(store.getPosition("paper-1")?.status, "dry_closed");
+      store.insertPosition({
+        id: "paper-sl",
+        traderUserId: "uid-1",
+        traderHandle: "alpha",
+        tradeId: "sl-1",
+        chain: "solana",
+        tokenAddress: MINT,
+        tokenSymbol: "TOK",
+        entryUsd: 2,
+        sizeUsd: 2,
+        remainingUsd: 2,
+        quantityRaw: "1000",
+        entryPriceUsd: null,
+        traderSizeAtEntryUsd: 1000,
+        traderTokenAmountAtEntry: null,
+        openedAt: new Date().toISOString(),
+        sourceEventId: "sl-1",
+        status: "dry_open",
+        isDryRun: true,
+      });
+      await engine.closePosition(store.getPosition("paper-sl")!, "stop_loss");
+      assert.equal(store.getPosition("paper-sl")?.status, "dry_closed");
+      store.insertPosition({
+        id: "paper-2",
+        traderUserId: "uid-1",
+        traderHandle: "alpha",
+        tradeId: "buy-2",
+        chain: "solana",
+        tokenAddress: MINT,
+        tokenSymbol: "TOK",
+        entryUsd: 2,
+        sizeUsd: 2,
+        remainingUsd: 2,
+        quantityRaw: "1000",
+        entryPriceUsd: null,
+        traderSizeAtEntryUsd: 1000,
+        traderTokenAmountAtEntry: null,
+        openedAt: new Date().toISOString(),
+        sourceEventId: "buy-2",
+        status: "dry_open",
+        isDryRun: true,
+      });
       const wrote = await engine.writeOffToken(MINT);
       assert.match(wrote, /Wrote off/);
       assert.equal(store.listOpen({ includeDryRun: true }).length, 0);
@@ -197,17 +258,59 @@ describe("committed config has no secrets and local yaml wins", () => {
     }
   });
 
-  it("a local config.yaml replaces the example entirely", () => {
+  it("a local overlay keeps omitted safety keys and accepts fixedUsd 1", () => {
     const dir = path.join(root, "data", "test-local-cfg");
     fs.mkdirSync(dir, { recursive: true });
-    const yaml = fs
-      .readFileSync(path.join(root, "config.example.yaml"), "utf8")
-      .replace("fixedUsd: 2", "fixedUsd: 1");
-    const file = path.join(dir, "config.yaml");
-    fs.writeFileSync(file, yaml);
-    const cfg = loadAppConfig(file);
-    assert.equal(cfg.sizing.fixedUsd, 1);
-    assert.equal(cfg.risk.simMaxOverheadLamports, 5_000_000);
-    assert.equal(cfg.filters.minLiquidityUsd, 10_000);
+    const file = path.join(dir, "only-size.yaml");
+    fs.writeFileSync(file, "sizing:\n  fixedUsd: 1\n");
+    const dry = loadAppConfig(file);
+    assert.equal(dry.sizing.fixedUsd, 1);
+    assert.equal(dry.filters.minLiquidityUsd, 10_000);
+    assert.equal(dry.filters.maxTopHolderBps, 9000);
+    assert.equal(dry.filters.roundTripMaxLossBps, 2500);
+    assert.equal(dry.filters.tokenSafety, "block");
+    assert.equal(dry.risk.simulateBeforeSign, true);
+    assert.equal(dry.risk.stopLossPct, 25);
+    const live = loadAppConfig(file, { ...dryEnv(), dryRun: false });
+    assert.equal(live.sizing.fixedUsd, 1);
+    assert.equal(live.sizing.maxUsdPerTrade, 5);
+  });
+
+  it("live refuses a zeroed liquidity floor or a disabled or loosened holder cap", () => {
+    const dir = path.join(root, "data", "test-local-cfg");
+    fs.mkdirSync(dir, { recursive: true });
+    const base = fs.readFileSync(path.join(root, "config.example.yaml"), "utf8");
+    const live = { ...dryEnv(), dryRun: false };
+    const cases: Array<[string, string]> = [
+      ["liq.yaml", base.replace("minLiquidityUsd: 10000", "minLiquidityUsd: 0")],
+      ["holder0.yaml", base.replace("maxTopHolderBps: 9000", "maxTopHolderBps: 0")],
+      ["holder10000.yaml", base.replace("maxTopHolderBps: 9000", "maxTopHolderBps: 10000")],
+    ];
+    for (const [name, yaml] of cases) {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, yaml);
+      assert.throws(() => loadAppConfig(file, live), /LIVE refused/);
+      const paper = loadAppConfig(file, dryEnv());
+      assert.equal(paper.sizing.fixedUsd, 2);
+    }
   });
 });
+
+function dryEnv(): EnvConfig {
+  return {
+    fomoApiKey: "",
+    dryRun: true,
+    solanaRpcUrl: "http://127.0.0.1:1",
+    solanaPrivateKey: "",
+    jupiterApiKey: "",
+    baseRpcUrl: "",
+    basePrivateKey: "",
+    zeroXApiKey: "",
+    telegramBotToken: "",
+    telegramChatId: "",
+    telegramAllowedUserIds: [],
+    configPath: "",
+    dataDir: path.join(root, "data", "test-floor-env"),
+    killSwitchPath: path.join(root, "data", "test-floor-env", "k"),
+  };
+}

@@ -35,6 +35,22 @@ export function isPublicSolanaRpc(url: string): boolean {
   }
 }
 
+/** No RPC body to inspect. Callers must treat this as a block, including dry-run. */
+export function mintInspectionUnavailable(mint: string, detail: string): TokenSafetyFinding {
+  return {
+    mint,
+    program: "unknown",
+    freezeAuthority: null,
+    mintAuthority: null,
+    hasTransferHook: false,
+    hasTransferFee: false,
+    supply: null,
+    warnings: [detail],
+    blocked: true,
+    blockReason: "inspect_failed",
+  };
+}
+
 export const PUBLIC_RPC_HOLDER_WARNING =
   "Top-holder check is ON but SOLANA_RPC_URL is the public mainnet endpoint (api.mainnet-beta.solana.com). That RPC returns HTTP 429 for getTokenLargestAccounts, and this check fails closed, so every buy will be blocked. Point SOLANA_RPC_URL at a paid RPC that serves getTokenLargestAccounts. The check is not disabled.";
 const TOKEN_2022_PROGRAM = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";

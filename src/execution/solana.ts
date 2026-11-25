@@ -33,6 +33,7 @@ import {
   evaluateTopHolder,
   fetchLargestHolderAmount,
   inspectSolanaMint,
+  mintInspectionUnavailable,
   isPublicSolanaRpc,
   type TokenSafetyMode,
 } from "../security/tokenSafety.js";
@@ -517,7 +518,11 @@ export class SolanaExecutor implements Executor {
   private async checkTokenSafety(mint: string) {
     const mode = (this.cfg.filters.tokenSafety ?? "block") as TokenSafetyMode;
     if (mode === "off") return null;
-    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) return null;
+    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+      const detail = "mint inspection unavailable (fail closed)";
+      log.warn(`token_safety outcome=failed reason=inspect_failed detail=${detail}`);
+      return mintInspectionUnavailable(mint, detail);
+    }
     const finding = await inspectSolanaMint(this.rpcUrl, mint, {
       mode,
       blockFreezeAuthority: this.cfg.filters.blockFreezeAuthority ?? true,

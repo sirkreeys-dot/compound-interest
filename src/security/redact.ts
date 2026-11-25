@@ -24,5 +24,10 @@ export function redactSecrets(input: string): string {
         /((?:SOLANA|BASE)_PRIVATE_KEY\s*[=:]\s*)\S+/gi,
         "$1[REDACTED]",
       )
+      .replace(/https?:\/\/[^\s"'<>]+/gi, (url) =>
+        /api[-_]?key|apikey|\/v2\/[A-Za-z0-9_-]{8,}|quiknode|helius|alchemy/i.test(url)
+          ? "[REDACTED_URL]"
+          : url,
+      )
   );
 }

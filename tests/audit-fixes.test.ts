@@ -76,6 +76,25 @@ describe("C1 program allowlist and instruction decode", () => {
     if (!r.ok) assert.match(r.error, /not on the allowlist/);
   });
 
+  it("rejects a top-level pump.fun bonding-curve program", () => {
+    const payer = Keypair.generate();
+    const pump = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+    const tx = v0(
+      payer,
+      new TransactionInstruction({ programId: pump, keys: [], data: Buffer.from([0]) }),
+    );
+    const keys = accountKeysFromLoadedMessage(tx, []);
+    assert.ok(keys);
+    const r = inspectSwapInstructions({
+      tx,
+      accountKeys: keys!,
+      ourPubkey: payer.publicKey,
+      allowlist: allow,
+    });
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.error, /not on the allowlist/);
+  });
+
   it("rejects Approve and a second required signer", () => {
     assert.equal(FORBIDDEN_TOKEN_DISCRIMINATORS.has(4), true);
     const payer = Keypair.generate();

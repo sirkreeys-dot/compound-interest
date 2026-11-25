@@ -11,7 +11,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test tests/**/*.test.ts",
     "replay": "tsx scripts/dry-run-replay.ts",
-    "kill": "tsx scripts/kill.ts"
+    "kill": "tsx scripts/kill.ts",
+    "scan": "tsx scripts/secret-scan.ts",
+    "drift": "tsx scripts/slippage-drift.ts",
+    "local-validator": "tsx scripts/local-validator-traps.ts"
   },
   "engines": {
     "node": ">=22.5"

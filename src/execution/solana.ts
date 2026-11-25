@@ -11,7 +11,7 @@ import {
   accountKeysFromLoadedMessage,
   inspectSwapInstructions,
 } from "../security/programAllowlist.js";
-import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, rpcConnection } from "../utils/http.js";
+import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, isLoopbackRpc, rpcConnection, withRpcFailover } from "../utils/http.js";
 import { afterBlockhashCheck, outAmountDiverged, sameMessageBytes } from "../security/simGap.js";
 import { enforcedOverheadCap, overheadRejection, sumOverheadLamports } from "../security/overhead.js";
 import {
@@ -67,7 +67,7 @@ export function parallelSafetyAndOrder<A, B>(
   return Promise.all([safety(), order()]);
 }
 
-interface JupiterOrder {
+export interface JupiterOrder {
   transaction?: string | null;
   requestId?: string;
   outAmount?: string;
@@ -87,6 +87,16 @@ interface JupiterOrder {
   rentFeeLamports?: number;
 }
 
+export interface RouteProvider {
+  order(opts: {
+    inputMint: string;
+    outputMint: string;
+    amount: string;
+    slippageBps: number;
+    taker: string | null;
+  }): Promise<{ ok: true; order: JupiterOrder } | { ok: false; error: string }>;
+}
+
 export class SolanaExecutor implements Executor {
   readonly chain = "solana" as const;
   private readonly keypair: Keypair | null;
@@ -99,12 +109,17 @@ export class SolanaExecutor implements Executor {
   private readonly dryRunPubkey: string;
   /** Out amount of the buy leg inside the last round-trip simulation quote. */
   private roundTripBuyOut: string | null = null;
+  private readonly allowLoopback: boolean;
+  private readonly secondaryRpc: string | undefined;
+  private routeProvider: RouteProvider | null = null;
 
   constructor(env: EnvConfig, cfg: AppConfig, prices: PriceService, store: Store | null = null) {
     this.cfg = cfg;
     this.apiKey = env.jupiterApiKey;
     this.prices = prices;
     this.rpcUrl = env.solanaRpcUrl;
+    this.secondaryRpc = env.solanaRpcUrlSecondary;
+    this.allowLoopback = env.solanaAllowLoopback === true;
     this.store = store;
     this.dryRunPubkey = env.dryRunSolanaPubkey ?? "";
     if (env.solanaPrivateKey) {
@@ -165,6 +180,24 @@ export class SolanaExecutor implements Executor {
     );
   }
 
+  /** Test and local-validator harnesses inject a route. Production leaves this unset. */
+  setRouteProvider(provider: RouteProvider | null): void {
+    this.routeProvider = provider;
+  }
+
+  /** Signing pubkey, when a key is configured. The secret is not returned. */
+  walletPubkey(): string | null {
+    return this.keypair?.publicKey.toBase58() ?? null;
+  }
+
+  private rpcUnusable(): boolean {
+    return isLoopbackRpc(this.rpcUrl) && !this.allowLoopback;
+  }
+
+  private rpcUrls(): string[] {
+    return [this.rpcUrl, this.secondaryRpc].filter((url): url is string => !!url);
+  }
+
   private async requestOrder(opts: {
     inputMint: string;
     outputMint: string;
@@ -172,6 +205,7 @@ export class SolanaExecutor implements Executor {
     slippageBps: number;
     taker: string | null;
   }): Promise<{ ok: true; order: JupiterOrder } | { ok: false; error: string }> {
+    if (this.routeProvider) return this.routeProvider.order(opts);
     const params = new URLSearchParams({
       inputMint: opts.inputMint,
       outputMint: opts.outputMint,
@@ -442,7 +476,7 @@ export class SolanaExecutor implements Executor {
   > {
     const unique = [...new Set(addresses)];
     if (!unique.length) return { ok: true, tables: [] };
-    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+    if (this.rpcUnusable()) {
       return { ok: false, error: "cannot load address lookup tables" };
     }
     try {
@@ -469,7 +503,7 @@ export class SolanaExecutor implements Executor {
     const payer = new PublicKey(taker);
     const guarded = await this.guardSwapTx(tx, payer, mints);
     if (!guarded.ok) return this.finishSellSim("allowlist", live, guarded.error);
-    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+    if (this.rpcUnusable()) {
       return this.finishSellSim("no_rpc", live, "loopback RPC cannot simulate the bundled sell");
     }
     try {
@@ -518,23 +552,37 @@ export class SolanaExecutor implements Executor {
   private async checkTokenSafety(mint: string) {
     const mode = (this.cfg.filters.tokenSafety ?? "block") as TokenSafetyMode;
     if (mode === "off") return null;
-    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+    if (this.rpcUnusable()) {
       const detail = "mint inspection unavailable (fail closed)";
       log.warn(`token_safety outcome=failed reason=inspect_failed detail=${detail}`);
       return mintInspectionUnavailable(mint, detail);
     }
-    const finding = await inspectSolanaMint(this.rpcUrl, mint, {
+    let finding = await inspectSolanaMint(this.rpcUrl, mint, {
       mode,
       blockFreezeAuthority: this.cfg.filters.blockFreezeAuthority ?? true,
       blockTransferHooks: this.cfg.filters.blockTransferHooks ?? true,
       blockMintAuthority: this.cfg.filters.blockMintAuthority ?? true,
       maxTransferFeeBps: this.cfg.filters.maxTransferFeeBps ?? 100,
     });
+    if (finding.blockReason === "inspect_failed" && this.secondaryRpc) {
+      log.warn("primary mint inspect failed; trying the secondary RPC");
+      finding = await inspectSolanaMint(this.secondaryRpc, mint, {
+        mode,
+        blockFreezeAuthority: this.cfg.filters.blockFreezeAuthority ?? true,
+        blockTransferHooks: this.cfg.filters.blockTransferHooks ?? true,
+        blockMintAuthority: this.cfg.filters.blockMintAuthority ?? true,
+        maxTransferFeeBps: this.cfg.filters.maxTransferFeeBps ?? 100,
+      });
+    }
     if (finding.blocked) return finding;
 
     const maxBps = this.cfg.filters.maxTopHolderBps ?? 0;
     if (maxBps > 0) {
-      const largest = await fetchLargestHolderAmount(this.rpcUrl, mint);
+      let largest = await fetchLargestHolderAmount(this.rpcUrl, mint);
+      if (largest.failed && this.secondaryRpc) {
+        log.warn("primary top-holder lookup failed; trying the secondary RPC");
+        largest = await fetchLargestHolderAmount(this.secondaryRpc, mint);
+      }
       let supply: bigint | null = null;
       if (finding.supply && /^\d+$/.test(finding.supply)) supply = BigInt(finding.supply);
       const judged = evaluateTopHolder({
@@ -833,7 +881,7 @@ export class SolanaExecutor implements Executor {
             pendingId,
           };
         }
-        if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+        if (this.rpcUnusable()) {
           this.failPending(pendingId, "sim: refused — loopback RPC cannot simulate");
           return {
             ok: false,
@@ -982,12 +1030,13 @@ export class SolanaExecutor implements Executor {
           pendingId,
         };
       }
+      log.info(`sign message bytes match simulation bytes=${simulatedMessage.length}`);
       tx.sign([this.keypair!]);
       const signed = Buffer.from(tx.serialize()).toString("base64");
       const signature = bs58.encode(tx.signatures[0]!);
       broadcastSig = signature;
       let lastValidBlockHeight: number | null = null;
-      if (this.rpcUrl && !/127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+      if (!this.rpcUnusable()) {
         try {
           const latest = await rpcConnection(this.rpcUrl).getLatestBlockhash("confirmed");
           lastValidBlockHeight = latest.lastValidBlockHeight;
@@ -1004,6 +1053,46 @@ export class SolanaExecutor implements Executor {
           positionId: req.positionId ?? null,
           notes: `signed_before_execute requestId=${liveOrder.requestId ?? ""}`,
         });
+      }
+
+      if (this.allowLoopback) {
+        const local = await this.broadcastLocal(tx, signature);
+        if (local.ok) {
+          if (pendingId && this.store) {
+            this.store.updatePendingSwap(pendingId, { status: "confirmed", txSignature: signature });
+          }
+          log.info(`local broadcast confirmed signature=${signature}`);
+          return {
+            ok: true,
+            dryRun: false,
+            txHash: signature,
+            outAmountRaw: liveOrder.outAmount,
+            inAmountRaw: liveOrder.inAmount ?? amount,
+            outUsd,
+            quoteSummary: summary,
+            pendingId,
+            ...this.feeFields(liveOrder, req, side),
+          };
+        }
+        if (local.inFlight) {
+          return {
+            ok: false,
+            dryRun: false,
+            inFlight: true,
+            txHash: signature,
+            error: "in_flight: local signature not confirmed failed; not signing another transaction",
+            quoteSummary: summary,
+            pendingId,
+          };
+        }
+        this.failPending(pendingId, local.error);
+        return {
+          ok: false,
+          dryRun: false,
+          error: redactSecrets(local.error),
+          quoteSummary: summary,
+          pendingId,
+        };
       }
 
       const execRes = await fetchTimeout(
@@ -1167,7 +1256,7 @@ export class SolanaExecutor implements Executor {
     const lookups = tx.message.addressTableLookups ?? [];
     const tables = [];
     if (lookups.length) {
-      if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) {
+      if (this.rpcUnusable()) {
         return { ok: false, error: "tx: cannot resolve address lookup tables (fail closed)" };
       }
       const conn = rpcConnection(this.rpcUrl);
@@ -1194,26 +1283,61 @@ export class SolanaExecutor implements Executor {
   }
 
   /** Same transaction that was simulated. If the blockhash is dead or the RPC errors, do not sign. */
-  private async blockhashUsable(blockhash: string): Promise<boolean> {
-    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) return false;
+  private async broadcastLocal(
+    tx: VersionedTransaction,
+    signature: string,
+  ): Promise<{ ok: true } | { ok: false; error: string; inFlight?: boolean }> {
     try {
-      const res = await rpcConnection(this.rpcUrl).isBlockhashValid(blockhash, { commitment: "confirmed" });
-      return res.value === true;
+      const sig = await rpcConnection(this.rpcUrl).sendRawTransaction(Buffer.from(tx.serialize()), {
+        skipPreflight: false,
+        maxRetries: 2,
+      });
+      const latest = await rpcConnection(this.rpcUrl).getLatestBlockhash("confirmed");
+      const conf = await rpcConnection(this.rpcUrl).confirmTransaction(
+        {
+          signature: sig,
+          blockhash: tx.message.recentBlockhash,
+          lastValidBlockHeight: latest.lastValidBlockHeight,
+        },
+        "confirmed",
+      );
+      if (conf.value.err) return { ok: false, error: `local broadcast failed ${JSON.stringify(conf.value.err)}` };
+      if (sig !== signature) return { ok: false, error: "local broadcast signature mismatch" };
+      return { ok: true };
+    } catch (e) {
+      const outcome = await this.signatureOutcome(signature);
+      if (outcome === "success") return { ok: true };
+      if (outcome === "pending") {
+        return { ok: false, error: "local signature still pending", inFlight: true };
+      }
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  private async blockhashUsable(blockhash: string): Promise<boolean> {
+    if (this.rpcUnusable()) return false;
+    try {
+      return await withRpcFailover(this.rpcUrls(), async (url) => {
+        const res = await rpcConnection(url).isBlockhashValid(blockhash, { commitment: "confirmed" });
+        if (res.value !== true) throw new Error("blockhash not valid");
+        return true;
+      });
     } catch {
       return false;
     }
   }
 
   private async signatureOutcome(sig: string): Promise<"success" | "failed" | "pending"> {
-    if (!this.rpcUrl || /127\.0\.0\.1|localhost/i.test(this.rpcUrl)) return "pending";
+    if (this.rpcUnusable()) return "pending";
     try {
-      const conn = rpcConnection(this.rpcUrl);
-      const res = await conn.getSignatureStatuses([sig], { searchTransactionHistory: true });
-      const st = res.value?.[0];
-      if (!st) return "pending";
-      if (st.err) return "failed";
-      if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") return "success";
-      return "pending";
+      return await withRpcFailover(this.rpcUrls(), async (url) => {
+        const res = await rpcConnection(url).getSignatureStatuses([sig], { searchTransactionHistory: true });
+        const st = res.value?.[0];
+        if (!st) return "pending" as const;
+        if (st.err) return "failed" as const;
+        if (st.confirmationStatus === "confirmed" || st.confirmationStatus === "finalized") return "success" as const;
+        return "pending" as const;
+      });
     } catch {
       return "pending";
     }

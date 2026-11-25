@@ -8,7 +8,7 @@ import type { EnvConfig } from "../config.js";
 import type { TelegramNotifier } from "../notify/telegram.js";
 import type { AppConfig } from "../types.js";
 import { log } from "../utils/logger.js";
-import { rpcConnection } from "../utils/http.js";
+import { isLoopbackRpc, rpcConnection } from "../utils/http.js";
 import { redactSecrets } from "../security/redact.js";
 import type { PendingSwap, Store } from "./db.js";
 import { randomUUID } from "node:crypto";
@@ -21,6 +21,8 @@ export async function reconcilePendingSwaps(opts: {
   cfg: AppConfig;
   tg: TelegramNotifier;
   rpcUrl: string;
+  /** Local validator. Default false so a loopback URL is not treated as mainnet. */
+  allowLoopback?: boolean;
   connection?: Connection;
   getSignatureStatuses?: (
     sigs: string[],
@@ -40,7 +42,7 @@ export async function reconcilePendingSwaps(opts: {
 
   const conn =
     opts.connection ??
-    (opts.rpcUrl && !/127\.0\.0\.1|localhost/i.test(opts.rpcUrl) ? rpcConnection(opts.rpcUrl) : null);
+    (opts.rpcUrl && (opts.allowLoopback || !isLoopbackRpc(opts.rpcUrl)) ? rpcConnection(opts.rpcUrl) : null);
 
   for (const row of rows) {
     try {

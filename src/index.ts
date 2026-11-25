@@ -18,6 +18,7 @@ import { Store } from "./store/db.js";
 import type { NormalizedAlert } from "./types.js";
 import { KillSwitch } from "./utils/killswitch.js";
 import { log, setLogLevel } from "./utils/logger.js";
+import { assertHotWalletCeiling } from "./ops/wallet.js";
 
 async function main(): Promise<void> {
   const env = loadEnv();
@@ -33,6 +34,16 @@ async function main(): Promise<void> {
     env.telegramAllowedUserIds,
   );
   const exec = new ExecutionRouter(env, cfg, undefined, store);
+  if (!env.dryRun) {
+    const owner = exec.solana?.walletPubkey();
+    if (!owner) throw new Error("LIVE refused: SOLANA_PRIVATE_KEY is missing or invalid");
+    await assertHotWalletCeiling({
+      rpcUrl: env.solanaRpcUrl,
+      secondaryUrl: env.solanaRpcUrlSecondary,
+      owner,
+      maxSol: cfg.risk.maxWalletSol,
+    });
+  }
 
   let wsStatus = "starting";
   let fanout: FomoAlertFanout | null = null;
@@ -141,6 +152,7 @@ async function main(): Promise<void> {
       cfg,
       tg,
       rpcUrl: env.solanaRpcUrl,
+      allowLoopback: env.solanaAllowLoopback,
     });
   } catch (e) {
     log.warn("Pending swap reconciliation failed", e);

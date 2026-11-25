@@ -171,6 +171,10 @@ export interface AppConfig {
     solPriceDivergenceBps: number;
     /** Top-level programs allowed in a signed Jupiter transaction. */
     solanaProgramAllowlist: string[];
+    /** Pause new entries after this many consecutive live buy failures. 0 disables. */
+    maxConsecutiveFailures: number;
+    /** Refuse live startup when the wallet holds more than this many SOL. */
+    maxWalletSol: number;
   };
   quote: {
     solanaNative: string;
@@ -308,4 +312,5 @@ export type SkipReason =
   | "daily_loss_limit"
   | "round_trip"
   | "overhead"
+  | "in_flight"
   | "other";

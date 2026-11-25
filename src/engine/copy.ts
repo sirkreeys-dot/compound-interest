@@ -15,6 +15,7 @@ import { log } from "../utils/logger.js";
 import { KeyedMutex, Mutex } from "../utils/mutex.js";
 import { scaleRawAmount } from "../utils/money.js";
 import { redactSecrets } from "../security/redact.js";
+import { slippageDriftBps } from "../ops/drift.js";
 
 const CLAIM_ON_SKIP = new Set<SkipReason>([
   "trader_not_watched",
@@ -54,6 +55,8 @@ export class CopyEngine {
   private readonly heldTokens = new Set<string>();
   private reservedSpend = 0;
   private reservedSlots = 0;
+  /** Mints with a buy currently inside handleAlert, including ones waiting on the lock. */
+  private readonly mintBuys = new Set<string>();
   private readonly cooldownHold = new Map<string, number>();
   private actualSpend: number | null = null;
 
@@ -72,7 +75,16 @@ export class CopyEngine {
 
   async handleAlert(alert: NormalizedAlert, opts?: { suppressBuy?: boolean }): Promise<void> {
     const key = tokenLockKey(alert.chain, alert.tokenAddress ?? alert.eventId);
-    await this.withToken(key, () => this.handleExclusive(alert, opts));
+    let followOnBuy = false;
+    if (alert.alertType === "buy") {
+      followOnBuy = this.mintBuys.has(key);
+      this.mintBuys.add(key);
+    }
+    try {
+      await this.withToken(key, () => this.handleExclusive(alert, { ...opts, followOnBuy }));
+    } finally {
+      if (alert.alertType === "buy") this.mintBuys.delete(key);
+    }
   }
 
   /** REST (and any other batched feed) entry point. */
@@ -178,8 +190,13 @@ export class CopyEngine {
 
   private async handleExclusive(
     alert: NormalizedAlert,
-    opts?: { suppressBuy?: boolean },
+    opts?: { suppressBuy?: boolean; followOnBuy?: boolean },
   ): Promise<void> {
+    if (alert.alertType === "buy" && opts?.followOnBuy) {
+      log.info(`SKIP buy ${alert.tokenSymbol ?? "?"} @ ${alert.traderHandle}: in_flight concurrent buy`);
+      this.noteSkip(alert, "in_flight", "concurrent buy for this mint", { claim: true });
+      return;
+    }
     if (alert.alertType === "buy" && opts?.suppressBuy) {
       log.info(
         `SKIP buy ${alert.tokenSymbol ?? "?"} @ ${alert.traderHandle}: same_batch_sell ${batchSellKey(alert)}`,
@@ -335,6 +352,16 @@ export class CopyEngine {
       return;
     }
 
+    if (
+      alert.tokenAddress &&
+      this.store.hasUnresolvedPendingForToken(alert.chain, alert.tokenAddress)
+    ) {
+      log.info(`SKIP buy ${alert.tokenSymbol}: in_flight pending swap`);
+      this.noteSkip(alert, "in_flight", "unresolved pending swap for this mint");
+      await this.budget.runExclusive(async () => this.endEntry(gate.hold, false, sizeUsd));
+      return;
+    }
+
     let opened = false;
     try {
       opened = await this.executeBuy(alert, sizeUsd);
@@ -385,10 +412,31 @@ export class CopyEngine {
     pendingId = result.pendingId ?? pendingId;
 
     if (!result.ok) {
+      if (pendingId && !result.inFlight) {
+        this.store.updatePendingSwap(pendingId, {
+          status: "failed",
+          error: redactSecrets(result.error ?? "buy failed").slice(0, 500),
+        });
+      }
       const reason = execSkipReason(result.error);
       log.error(`Buy failed: ${result.error}`);
       this.noteSkip(alert, reason, result.error ? redactSecrets(result.error) : result.error);
+      if (!dryRun) {
+        noteLiveFailure(
+          this.store,
+          this.kill,
+          this.tg,
+          this.cfg.risk.maxConsecutiveFailures ?? 3,
+          result.error,
+        );
+      }
       return false;
+    }
+    if (!dryRun) this.store.setMeta("consecutive_failures", "0");
+    if (dryRun && result.outUsd != null) {
+      log.info(
+        `paper_vs_quote sizeUsd=${sizeUsd} outUsd=${result.outUsd} drift_bps=${slippageDriftBps(sizeUsd, result.outUsd) ?? "na"}`,
+      );
     }
     if (!dryRun && result.dryRun) {
       log.error("Buy returned dryRun result while LIVE — refusing to open position");
@@ -837,6 +885,23 @@ function fillDedupeKey(alert: NormalizedAlert): string | null {
 function lamports(value: number | undefined): string | null {
   if (value == null || !Number.isFinite(value) || value <= 0) return null;
   return String(Math.round(value));
+}
+
+function noteLiveFailure(
+  store: Store,
+  kill: KillSwitch,
+  tg: TelegramNotifier,
+  limit: number,
+  error: string | undefined,
+): void {
+  const next = Number(store.getMeta("consecutive_failures") ?? "0") + 1;
+  store.setMeta("consecutive_failures", String(next));
+  if (limit > 0 && next >= limit) {
+    kill.pause(`consecutive_failures:${next}`);
+    void tg.send(
+      `<b>HALT</b> ${next} consecutive live buy failures. New entries are paused. Sells still run. ${redactSecrets(error ?? "")}`,
+    );
+  }
 }
 
 function execSkipReason(error: string | undefined): SkipReason {

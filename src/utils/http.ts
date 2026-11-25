@@ -1,4 +1,5 @@
 import { Connection, type Commitment } from "@solana/web3.js";
+import { log } from "./logger.js";
 
 /** Outbound fetch with a hard timeout. A hung call must not hold a token lock forever. */
 export async function fetchTimeout(
@@ -70,4 +71,27 @@ export function rpcConnection(url: string, commitment: Commitment = "confirmed")
     disableRetryOnRateLimit: true,
     fetch: rpcFetch,
   });
+}
+
+export function isLoopbackRpc(url: string | undefined | null): boolean {
+  return !url || /127\.0\.0\.1|localhost/i.test(url);
+}
+
+/**
+ * Try each RPC in order. Each attempt uses rpcConnection's own bounded timeout
+ * and retry. The URL is never logged. There is no unbounded retry.
+ */
+export async function withRpcFailover<T>(urls: Array<string | undefined>, fn: (url: string) => Promise<T>): Promise<T> {
+  const list = urls.map((url) => url?.trim() ?? "").filter(Boolean);
+  if (!list.length) throw new Error("no rpc url");
+  let last: unknown;
+  for (let i = 0; i < list.length; i++) {
+    try {
+      return await fn(list[i]!);
+    } catch (e) {
+      last = e;
+      if (i < list.length - 1) log.warn("RPC endpoint failed; trying the next configured endpoint");
+    }
+  }
+  throw last instanceof Error ? last : new Error("rpc failed");
 }

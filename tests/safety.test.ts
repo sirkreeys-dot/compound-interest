@@ -303,7 +303,8 @@ describe("safety: DRY_RUN never signs; live without keys fails closed", () => {
     store.close();
   });
 
-  it("live executor without key returns ok:false (SolanaExecutor)", async () => {
+  it("live executor without key returns ok:false only when DRY_RUN is explicitly false", async () => {
+    const prev = process.env.DRY_RUN;
     const cfg = cfgManual();
     const env: EnvConfig = {
       fomoApiKey: "",
@@ -323,15 +324,21 @@ describe("safety: DRY_RUN never signs; live without keys fails closed", () => {
     };
     fs.mkdirSync(env.dataDir, { recursive: true });
     const router = new ExecutionRouter(env, cfg);
-    const r = await router.buy("solana", {
-      sellToken: "",
-      buyToken: "6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP",
-      sellUsd: 2,
-      slippageBps: 100,
-      dryRun: false,
-    });
-    assert.equal(r.ok, false);
-    assert.match(r.error ?? "", /SOLANA_PRIVATE_KEY/);
+    try {
+      process.env.DRY_RUN = "false";
+      const r = await router.buy("solana", {
+        sellToken: "",
+        buyToken: "6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP",
+        sellUsd: 2,
+        slippageBps: 100,
+        dryRun: false,
+      });
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /SOLANA_PRIVATE_KEY/);
+    } finally {
+      if (prev === undefined) delete process.env.DRY_RUN;
+      else process.env.DRY_RUN = prev;
+    }
   });
 });
 

@@ -29,6 +29,7 @@ import {
 } from "../security/baseChecks.js";
 import { redactSecrets } from "../security/redact.js";
 import { validateZeroXQuote, ZEROX_ALLOWANCE_HOLDER_CANCUN } from "../security/zeroxTx.js";
+import { assertLiveAllowed } from "../security/dryRunGuard.js";
 import type { Executor, SwapRequest, SwapResult } from "./types.js";
 
 const ZEROX = "https://api.0x.org";
@@ -118,6 +119,7 @@ export class BaseExecutor implements Executor {
   }
 
   private async swap(req: SwapRequest): Promise<SwapResult> {
+    if (!req.dryRun) assertLiveAllowed();
     if (!req.dryRun && !this.ready()) {
       return {
         ok: false,
@@ -280,6 +282,7 @@ export class BaseExecutor implements Executor {
           quoteSummary: summary,
         };
       }
+      assertLiveAllowed();
       const hash = await this.walletClient!.sendTransaction({
         to: ZEROX_ALLOWANCE_HOLDER_CANCUN as Address,
         data: tx.data as Hex,

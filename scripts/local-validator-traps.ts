@@ -73,6 +73,7 @@ function logLine(kind: string, mint: string, reason: string, detail: string): vo
 
 async function main(): Promise<void> {
   if (!fs.existsSync(KEY_PATH)) throw new Error(`missing throwaway key file ${KEY_PATH}`);
+  process.env.DRY_RUN = "false";
   cli("solana", ["config", "set", "--url", RPC, "--keypair", KEY_PATH, "-C", "/tmp/solana-cli.yml"]);
   const secret = Uint8Array.from(JSON.parse(fs.readFileSync(KEY_PATH, "utf8")) as number[]);
   const payer = Keypair.fromSecretKey(secret);

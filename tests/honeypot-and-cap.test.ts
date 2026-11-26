@@ -55,6 +55,8 @@ describe("sell simulation outcomes", () => {
     "high_tax",
     "no_route",
     "sim_error",
+    "sim_inconclusive",
+    "rate_limited",
     "timeout",
     "allowlist",
   ];

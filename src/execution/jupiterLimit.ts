@@ -135,6 +135,26 @@ export function sleepRateLimit(ms: number): Promise<void> {
 }
 
 const RATE_LIMIT_ATTEMPTS = 3;
+const QUOTE_CACHE_MS = 4_000;
+
+type CachedGet = { at: number; status: number; body: string };
+const getCache = new Map<string, CachedGet>();
+
+function cacheableGet(url: string, method: string): boolean {
+  if (method !== "GET") return false;
+  if (url.includes("/execute")) return false;
+  return url.includes("/quote") || url.includes("/price/");
+}
+
+/** Add up to 250ms so retries do not line up. The base delay stays capped at 8s. */
+export function backoffWithJitter(baseMs: number, rand = Math.random()): number {
+  const jitter = Math.floor(Math.max(0, Math.min(1, rand)) * 250);
+  return Math.min(8_000, baseMs + jitter);
+}
+
+export function clearJupiterCacheForTests(): void {
+  getCache.clear();
+}
 
 export async function jupiterFetch(
   input: string,
@@ -150,17 +170,33 @@ export async function jupiterFetch(
 ): Promise<Response> {
   const limiter = opts.limiter ?? getJupiterLimiter();
   const headers = jupiterHeaders(opts.apiKey, init.headers);
+  const method = (init.method ?? "GET").toUpperCase();
+  const cacheKey = `${method} ${input}`;
+  const useCache = cacheableGet(input, method) && (opts.fetchImpl == null || opts.fetchImpl === globalThis.fetch);
+  if (useCache) {
+    const hit = getCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < QUOTE_CACHE_MS) {
+      return new Response(hit.body, { status: hit.status });
+    }
+  }
   const attempts = opts.retry429 === false ? 1 : RATE_LIMIT_ATTEMPTS;
   let last: Response | null = null;
   for (let attempt = 0; attempt < attempts; attempt++) {
     await limiter.acquire(opts.priority);
     last = await fetchRetry(
       input,
-      { ...init, headers },
+      { ...init, method, headers },
       { timeoutMs: QUOTE_TIMEOUT_MS, retries: 2, fetchImpl: opts.fetchImpl, retry429: false },
     );
-    if (last.status !== 429 || attempt === attempts - 1) return last;
-    await sleepRateLimit(rateLimitBackoffMs(attempt, last.headers.get("retry-after")));
+    if (last.status !== 429 || attempt === attempts - 1) break;
+    const base = rateLimitBackoffMs(attempt, last.headers.get("retry-after"));
+    await sleepRateLimit(backoffWithJitter(base));
   }
-  return last ?? new Response("", { status: 429 });
+  const res = last ?? new Response("", { status: 429 });
+  if (useCache && res.status === 200) {
+    const body = await res.text();
+    getCache.set(cacheKey, { at: Date.now(), status: res.status, body });
+    return new Response(body, { status: res.status });
+  }
+  return res;
 }

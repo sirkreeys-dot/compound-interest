@@ -11,7 +11,8 @@ import {
   accountKeysFromLoadedMessage,
   inspectSwapInstructions,
 } from "../security/programAllowlist.js";
-import { jupiterFetch, type JupiterPriority } from "./jupiterLimit.js";
+import { assertLiveAllowed } from "../security/dryRunGuard.js";
+import { getJupiterLimiter, jupiterFetch, type JupiterPriority } from "./jupiterLimit.js";
 import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, isLoopbackRpc, rpcConnection, withRpcFailover } from "../utils/http.js";
 import { afterBlockhashCheck, outAmountDiverged, sameMessageBytes } from "../security/simGap.js";
 import { enforcedOverheadCap, overheadRejection, sumOverheadLamports } from "../security/overhead.js";
@@ -20,6 +21,8 @@ import {
   altAddressesFromSwapBodies,
   compileRoundTripForSim,
   instructionsFromSwapBody,
+  nextSimAction,
+  quoteFailureReason,
   roundTripSellAmount,
   sellSimLogLine,
   sellSimReasonFromRpc,
@@ -306,7 +309,7 @@ export class SolanaExecutor implements Executor {
       slippageBps: this.cfg.risk.maxSlippageBps,
       taker: null,
     });
-    if (!quoted.ok) return this.finishSellSim("no_route", live, quoted.error);
+    if (!quoted.ok) return this.finishSellSim(quoteFailureReason(quoted.error), live, quoted.error);
     let outUsd =
       quoted.order.outUsdValue != null && quoted.order.outUsdValue > 0
         ? quoted.order.outUsdValue
@@ -342,10 +345,31 @@ export class SolanaExecutor implements Executor {
       taker,
     });
     if (!built.ok) {
-      const reason: SellSimReason = built.code === "no_sell_quote" || built.code === "no_buy_quote" ? "no_route" : "sim_error";
+      const reason: SellSimReason =
+        quoteFailureReason(built.error) === "rate_limited"
+          ? "rate_limited"
+          : built.code === "no_sell_quote" || built.code === "no_buy_quote"
+            ? "no_route"
+            : "sim_error";
       return this.finishSellSim(reason, live, `${built.code}: ${built.error}`);
     }
-    return this.simulateCompiledRoundTrip(built.tx, taker, live, [buyToken, this.cfg.quote.solanaNative]);
+    let sim = await this.simulateCompiledRoundTrip(built.tx, taker, [buyToken, this.cfg.quote.solanaNative]);
+    if (nextSimAction(sim.reason, 0) === "requote") {
+      log.warn(`sell_sim re-quote once reason=sim_inconclusive detail=${sim.detail}`);
+      const again = await this.buildInstructionRoundTrip({
+        buyMint: buyToken,
+        buyAmountRaw,
+        sellAmountRaw: sellAmount,
+        taker,
+      });
+      if (!again.ok) {
+        const reason: SellSimReason =
+          quoteFailureReason(again.error) === "rate_limited" ? "rate_limited" : "sim_error";
+        return this.finishSellSim(reason, live, `${again.code}: ${again.error}`);
+      }
+      sim = await this.simulateCompiledRoundTrip(again.tx, taker, [buyToken, this.cfg.quote.solanaNative]);
+    }
+    return this.finishSellSim(sim.reason, live, sim.detail);
   }
 
   private async quoteDepthError(mint: string, sellImpactBps: number | null): Promise<string | null> {
@@ -503,14 +527,13 @@ export class SolanaExecutor implements Executor {
   private async simulateCompiledRoundTrip(
     tx: VersionedTransaction,
     taker: string,
-    live: boolean,
     mints: string[],
-  ): Promise<string | null> {
+  ): Promise<{ reason: SellSimReason; detail: string }> {
     const payer = new PublicKey(taker);
     const guarded = await this.guardSwapTx(tx, payer, mints);
-    if (!guarded.ok) return this.finishSellSim("allowlist", live, guarded.error);
+    if (!guarded.ok) return { reason: "allowlist", detail: guarded.error };
     if (this.rpcUnusable()) {
-      return this.finishSellSim("no_rpc", live, "loopback RPC cannot simulate the bundled sell");
+      return { reason: "no_rpc", detail: "loopback RPC cannot simulate the bundled sell" };
     }
     try {
       const conn = rpcConnection(this.rpcUrl);
@@ -519,16 +542,19 @@ export class SolanaExecutor implements Executor {
         replaceRecentBlockhash: true,
       });
       const reason = sellSimReasonFromRpc(sim.value);
-      if (reason === "simulated") return this.finishSellSim("simulated", live, "buy-then-sell simulation succeeded");
+      if (reason === "simulated") return { reason, detail: "buy-then-sell simulation succeeded" };
       if (reason === "no_balance") {
-        return this.finishSellSim("no_balance", live, "simulation could not fund the buy; not a pass");
+        return { reason, detail: "simulation could not fund the buy; not a pass" };
       }
-      if (reason === "sim_error") return this.finishSellSim("sim_error", live, "null simulation response");
-      return this.finishSellSim("honeypot", live, JSON.stringify(sim.value?.err));
+      if (reason === "sim_error") return { reason, detail: "null simulation response" };
+      if (reason === "sim_inconclusive") {
+        return { reason, detail: `non-honeypot simulation error ${JSON.stringify(sim.value?.err)}` };
+      }
+      return { reason: "honeypot", detail: JSON.stringify(sim.value?.err) };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const reason: SellSimReason = /abort|timeout/i.test(msg) ? "timeout" : "sim_error";
-      return this.finishSellSim(reason, live, msg);
+      return { reason, detail: msg };
     }
   }
 
@@ -658,6 +684,7 @@ export class SolanaExecutor implements Executor {
   }
 
   private async swap(req: SwapRequest, side: "buy" | "sell"): Promise<SwapResult> {
+    if (!req.dryRun) assertLiveAllowed();
     let pendingId = req.pendingId;
     let broadcastSig: string | null = null;
     try {
@@ -1038,6 +1065,7 @@ export class SolanaExecutor implements Executor {
           pendingId,
         };
       }
+      assertLiveAllowed();
       log.info(`sign message bytes match simulation bytes=${simulatedMessage.length}`);
       tx.sign([this.keypair!]);
       const signed = Buffer.from(tx.serialize()).toString("base64");
@@ -1103,6 +1131,8 @@ export class SolanaExecutor implements Executor {
         };
       }
 
+      assertLiveAllowed();
+      await getJupiterLimiter().acquire(side === "sell" ? "sell" : "buy");
       const execRes = await fetchTimeout(
         `${JUP_BASE}/execute`,
         {
@@ -1295,10 +1325,11 @@ export class SolanaExecutor implements Executor {
     tx: VersionedTransaction,
     signature: string,
   ): Promise<{ ok: true } | { ok: false; error: string; inFlight?: boolean }> {
+    assertLiveAllowed();
     try {
       const sig = await rpcConnection(this.rpcUrl).sendRawTransaction(Buffer.from(tx.serialize()), {
         skipPreflight: false,
-        maxRetries: 2,
+        maxRetries: 0,
       });
       const latest = await rpcConnection(this.rpcUrl).getLatestBlockhash("confirmed");
       const conf = await rpcConnection(this.rpcUrl).confirmTransaction(

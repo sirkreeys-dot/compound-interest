@@ -13,7 +13,7 @@ import {
   type AddressLookupTableAccount,
 } from "@solana/web3.js";
 
-export type SellSimClass = "ok" | "no_balance" | "honeypot";
+export type SellSimClass = "ok" | "no_balance" | "honeypot" | "inconclusive";
 
 /** passed: simulation succeeded. skipped: could not run (not a pass). failed: ran and refused. */
 export type SellSimOutcome = "passed" | "skipped" | "failed";
@@ -27,6 +27,8 @@ export type SellSimReason =
   | "honeypot"
   | "high_tax"
   | "sim_error"
+  | "sim_inconclusive"
+  | "rate_limited"
   | "timeout"
   | "allowlist";
 
@@ -55,6 +57,7 @@ export function sellSimReasonFromRpc(
   const klass = classifySellSimulation(value.err, value.logs);
   if (klass === "ok") return "simulated";
   if (klass === "no_balance") return "no_balance";
+  if (klass === "inconclusive") return "sim_inconclusive";
   return "honeypot";
 }
 
@@ -184,9 +187,44 @@ export function compileRoundTripForSim(opts: {
   return { tx, bytes };
 }
 
+/** First inconclusive simulation is rebuilt once. A second one is the final refusal. */
+export function nextSimAction(reason: SellSimReason, attempt: number): "done" | "requote" {
+  if (reason === "sim_inconclusive" && attempt === 0) return "requote";
+  return "done";
+}
+
+/**
+ * Jupiter custom codes that are not a honeypot.
+ * 6025 InvalidTokenAccount is documented by Jupiter:
+ * https://developers.jup.ag/docs/swap/v1/common-errors
+ * and the program IDL at
+ * https://solscan.io/account/JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4#programIdl
+ * It means a token account in the instruction is uninitialized or not the expected one.
+ * That happens when the buy and sell legs are built separately and then concatenated.
+ */
+const JUPITER_INCONCLUSIVE = new Set([6001, 6008, 6014, 6017, 6024, 6025]);
+
+export function jupiterCustomCode(err: unknown): number | null {
+  const text = typeof err === "string" ? err : JSON.stringify(err ?? null);
+  const match = text.match(/"Custom"\s*:\s*(\d+)/);
+  if (!match) return null;
+  const code = Number(match[1]);
+  return Number.isFinite(code) ? code : null;
+}
+
+/** A quote/order failure that is a 429 is not "no route". */
+export function quoteFailureReason(error: string): "rate_limited" | "no_route" {
+  if (/\b429\b/i.test(error) || /too many requests/i.test(error) || /rate_limited/i.test(error)) {
+    return "rate_limited";
+  }
+  return "no_route";
+}
+
 /** Quote success is not a sell. Only a simulation error class decides. */
 export function classifySellSimulation(err: unknown, logs?: string[] | null): SellSimClass {
   if (err == null) return "ok";
+  const code = jupiterCustomCode(err);
+  if (code != null && JUPITER_INCONCLUSIVE.has(code)) return "inconclusive";
   const text = `${JSON.stringify(err)}\n${(logs ?? []).join("\n")}`.toLowerCase();
   if (
     text.includes("insufficient") ||
@@ -196,6 +234,15 @@ export function classifySellSimulation(err: unknown, logs?: string[] | null): Se
     /custom program error: 0x1(?![0-9a-f])/i.test(text)
   ) {
     return "no_balance";
+  }
+  if (
+    code === 17 ||
+    text.includes("account is frozen") ||
+    text.includes("accountfrozen") ||
+    text.includes("transfer hook") ||
+    text.includes("transferhook")
+  ) {
+    return "honeypot";
   }
   return "honeypot";
 }

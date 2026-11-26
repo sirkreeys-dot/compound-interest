@@ -1,4 +1,5 @@
 import { Connection, type Commitment } from "@solana/web3.js";
+import { log } from "./logger.js";
 
 /** Outbound fetch with a hard timeout. A hung call must not hold a token lock forever. */
 export async function fetchTimeout(
@@ -27,16 +28,18 @@ function sleep(ms: number): Promise<void> {
 export async function fetchRetry(
   input: string | URL,
   init: RequestInit = {},
-  opts: { timeoutMs?: number; retries?: number; fetchImpl?: typeof fetch } = {},
+  opts: { timeoutMs?: number; retries?: number; fetchImpl?: typeof fetch; retry429?: boolean } = {},
 ): Promise<Response> {
   const timeoutMs = opts.timeoutMs ?? HTTP_TIMEOUT_MS;
   const retries = opts.retries ?? 2;
   const fetchImpl = opts.fetchImpl ?? fetch;
+  const retry429 = opts.retry429 !== false;
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const res = await fetchTimeout(input, init, timeoutMs, fetchImpl);
-      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+      const retryStatus = res.status >= 500 || (retry429 && res.status === 429);
+      if (retryStatus && attempt < retries) {
         await sleep(Math.min(4_000, 200 * 2 ** attempt));
         continue;
       }
@@ -70,4 +73,27 @@ export function rpcConnection(url: string, commitment: Commitment = "confirmed")
     disableRetryOnRateLimit: true,
     fetch: rpcFetch,
   });
+}
+
+export function isLoopbackRpc(url: string | undefined | null): boolean {
+  return !url || /127\.0\.0\.1|localhost/i.test(url);
+}
+
+/**
+ * Try each RPC in order. Each attempt uses rpcConnection's own bounded timeout
+ * and retry. The URL is never logged. There is no unbounded retry.
+ */
+export async function withRpcFailover<T>(urls: Array<string | undefined>, fn: (url: string) => Promise<T>): Promise<T> {
+  const list = urls.map((url) => url?.trim() ?? "").filter(Boolean);
+  if (!list.length) throw new Error("no rpc url");
+  let last: unknown;
+  for (let i = 0; i < list.length; i++) {
+    try {
+      return await fn(list[i]!);
+    } catch (e) {
+      last = e;
+      if (i < list.length - 1) log.warn("RPC endpoint failed; trying the next configured endpoint");
+    }
+  }
+  throw last instanceof Error ? last : new Error("rpc failed");
 }

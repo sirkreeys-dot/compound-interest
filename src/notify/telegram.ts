@@ -4,6 +4,7 @@
  * Env: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
  * Commands (restricted to TELEGRAM_CHAT_ID): /status /positions /pause /resume /help
  */
+import { redactSecrets } from "../security/redact.js";
 import { fetchRetry } from "../utils/http.js";
 import { log } from "../utils/logger.js";
 import type { KillSwitch } from "../utils/killswitch.js";
@@ -82,8 +83,9 @@ export class TelegramNotifier {
   }
 
   async send(text: string, parseMode: "HTML" | "Markdown" = "HTML"): Promise<void> {
+    const safe = redactSecrets(text);
     if (!this.enabled) {
-      log.debug(`Telegram skip (disabled): ${text.slice(0, 80)}`);
+      log.debug(`Telegram skip (disabled): ${safe.slice(0, 80)}`);
       return;
     }
     try {
@@ -92,7 +94,7 @@ export class TelegramNotifier {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           chat_id: this.chatId,
-          text,
+          text: safe,
           parse_mode: parseMode,
           disable_web_page_preview: true,
         }),

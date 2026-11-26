@@ -12,6 +12,7 @@ import { ExecutionRouter } from "../src/execution/index.js";
 import { TelegramNotifier } from "../src/notify/telegram.js";
 import { Store } from "../src/store/db.js";
 import { KillSwitch } from "../src/utils/killswitch.js";
+import { setRateLimitSleepForTests } from "../src/execution/jupiterLimit.js";
 import { sellFraction, scaleRawAmount, usdToTokenRaw, rawToUsd } from "../src/utils/money.js";
 import type { AppConfig, NormalizedAlert } from "../src/types.js";
 import type { EnvConfig } from "../src/config.js";
@@ -49,6 +50,10 @@ class FakeExec implements Executor {
   buys = 0;
   sells = 0;
   signed = false;
+  failLive = false;
+  delayMs = 0;
+  sellErrors: string[] = [];
+  slippage: number[] = [];
   lastSellRaw: string | undefined;
   constructor(private readonly dryOk = true) {}
   ready() {
@@ -56,7 +61,9 @@ class FakeExec implements Executor {
   }
   async buyToken(req: SwapRequest): Promise<SwapResult> {
     this.buys++;
+    if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));
     if (!req.dryRun) this.signed = true;
+    if (this.failLive && !req.dryRun) return { ok: false, dryRun: false, error: "boom" };
     if (!this.dryOk && req.dryRun) return { ok: false, dryRun: true, error: "quote fail" };
     return {
       ok: true,
@@ -68,8 +75,11 @@ class FakeExec implements Executor {
   }
   async sellToken(req: SwapRequest): Promise<SwapResult> {
     this.sells++;
+    this.slippage.push(req.slippageBps);
     this.lastSellRaw = req.sellAmountRaw;
     if (!req.dryRun) this.signed = true;
+    const err = this.sellErrors.shift();
+    if (err) return { ok: false, dryRun: req.dryRun, error: err };
     return {
       ok: true,
       dryRun: req.dryRun,
@@ -168,6 +178,117 @@ describe("safety: claimEvent dedupe + no double buy", () => {
     assert.equal(fake.buys, 1);
     store.close();
   });
+
+  it("two concurrent signals for the same mint produce one buy", async () => {
+    const fake = new FakeExec();
+    fake.delayMs = 40;
+    const { engine, store } = await setup(path.join(tmpRoot, "race-mint"), true, fake);
+    await Promise.all([
+      engine.handleAlert(alert({ eventId: "race-a", tradeId: "ta" })),
+      engine.handleAlert(alert({ eventId: "race-b", tradeId: "tb" })),
+    ]);
+    assert.equal(fake.buys, 1);
+    assert.equal(store.listOpen({ includeDryRun: true }).length, 1);
+    store.close();
+  });
+
+  it("three live buy failures pause entries and still allow a sell", async () => {
+    const fake = new FakeExec();
+    fake.failLive = true;
+    const { engine, store, kill } = await setup(path.join(tmpRoot, "streak"), false, fake);
+    for (let i = 0; i < 3; i++) {
+      await engine.handleAlert(alert({ eventId: `fail-${i}`, tradeId: `tf-${i}` }));
+    }
+    assert.equal(kill.isPaused(), true);
+    assert.equal(store.getMeta("consecutive_failures"), "3");
+    store.insertPosition({
+      id: "p1",
+      traderUserId: "uid-1",
+      traderHandle: "alpha",
+      tradeId: null,
+      chain: "solana",
+      tokenAddress: "6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP",
+      tokenSymbol: "TOK",
+      entryUsd: 2,
+      sizeUsd: 2,
+      remainingUsd: 2,
+      quantityRaw: "1000",
+      entryPriceUsd: null,
+      traderSizeAtEntryUsd: 1000,
+      traderTokenAmountAtEntry: null,
+      openedAt: new Date().toISOString(),
+      sourceEventId: "seed",
+      status: "open",
+      isDryRun: false,
+    });
+    await engine.closePosition(store.getPosition("p1")!, "stop_loss");
+    assert.equal(fake.sells, 1);
+    store.close();
+  });
+
+  it("a zero-raw partial sell does not call the executor", async () => {
+    const fake = new FakeExec();
+    const { engine, store } = await setup(path.join(tmpRoot, "dust"), true, fake);
+    store.insertPosition({
+      id: "dust",
+      traderUserId: "uid-1",
+      traderHandle: "alpha",
+      tradeId: null,
+      chain: "solana",
+      tokenAddress: "6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP",
+      tokenSymbol: "TOK",
+      entryUsd: 2,
+      sizeUsd: 2,
+      remainingUsd: 2,
+      quantityRaw: "1",
+      entryPriceUsd: null,
+      traderSizeAtEntryUsd: 1000,
+      traderTokenAmountAtEntry: null,
+      openedAt: new Date().toISOString(),
+      sourceEventId: "dust",
+      status: "dry_open",
+      isDryRun: true,
+    });
+    await engine.closePosition(store.getPosition("dust")!, "mirror", undefined, { fraction: 0.5 });
+    assert.equal(fake.sells, 0);
+    assert.equal(store.getPosition("dust")?.status, "dry_open");
+    store.close();
+  });
+
+  it("a 429 retries the same sell rung and does not advance the ladder", async () => {
+    setRateLimitSleepForTests(async () => {});
+    const fake = new FakeExec();
+    fake.sellErrors = ["Jupiter /order 429: Too many requests"];
+    const { engine, store } = await setup(path.join(tmpRoot, "rate"), true, fake);
+    store.insertPosition({
+      id: "rate",
+      traderUserId: "uid-1",
+      traderHandle: "alpha",
+      tradeId: null,
+      chain: "solana",
+      tokenAddress: "6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP",
+      tokenSymbol: "TOK",
+      entryUsd: 2,
+      sizeUsd: 2,
+      remainingUsd: 2,
+      quantityRaw: "1000",
+      entryPriceUsd: null,
+      traderSizeAtEntryUsd: 1000,
+      traderTokenAmountAtEntry: null,
+      openedAt: new Date().toISOString(),
+      sourceEventId: "rate",
+      status: "dry_open",
+      isDryRun: true,
+    });
+    try {
+      await engine.closePosition(store.getPosition("rate")!, "stop_loss");
+      assert.deepEqual(fake.slippage.slice(0, 2), [300, 300]);
+      assert.equal(store.getPosition("rate")?.status, "dry_closed");
+    } finally {
+      setRateLimitSleepForTests(null);
+    }
+    store.close();
+  });
 });
 
 describe("safety: DRY_RUN never signs; live without keys fails closed", () => {
@@ -182,7 +303,8 @@ describe("safety: DRY_RUN never signs; live without keys fails closed", () => {
     store.close();
   });
 
-  it("live executor without key returns ok:false (SolanaExecutor)", async () => {
+  it("live executor without key returns ok:false only when DRY_RUN is explicitly false", async () => {
+    const prev = process.env.DRY_RUN;
     const cfg = cfgManual();
     const env: EnvConfig = {
       fomoApiKey: "",
@@ -202,15 +324,21 @@ describe("safety: DRY_RUN never signs; live without keys fails closed", () => {
     };
     fs.mkdirSync(env.dataDir, { recursive: true });
     const router = new ExecutionRouter(env, cfg);
-    const r = await router.buy("solana", {
-      sellToken: "",
-      buyToken: "6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP",
-      sellUsd: 2,
-      slippageBps: 100,
-      dryRun: false,
-    });
-    assert.equal(r.ok, false);
-    assert.match(r.error ?? "", /SOLANA_PRIVATE_KEY/);
+    try {
+      process.env.DRY_RUN = "false";
+      const r = await router.buy("solana", {
+        sellToken: "",
+        buyToken: "6863YfxMrFZhKidtv7oCcfoL2s6hvnfp7cSnBoKMp1dP",
+        sellUsd: 2,
+        slippageBps: 100,
+        dryRun: false,
+      });
+      assert.equal(r.ok, false);
+      assert.match(r.error ?? "", /SOLANA_PRIVATE_KEY/);
+    } finally {
+      if (prev === undefined) delete process.env.DRY_RUN;
+      else process.env.DRY_RUN = prev;
+    }
   });
 });
 

@@ -1042,6 +1042,18 @@ export class Store {
   }
 
   /** Rows that still need attention after a crash / failed insertPosition. */
+  hasUnresolvedPendingForToken(chain: string, tokenAddress: string): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT id FROM pending_swaps
+         WHERE chain = ? AND token_address = ?
+           AND status IN ('pending_broadcast','broadcast','unresolved','unknown')
+         LIMIT 1`,
+      )
+      .get(chain, tokenAddress) as { id: string } | undefined;
+    return row != null;
+  }
+
   listUnresolvedPending(): PendingSwap[] {
     const rows = this.db
       .prepare(

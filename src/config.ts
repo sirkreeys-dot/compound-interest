@@ -117,6 +117,9 @@ const configSchema = z.object({
     solPriceDivergenceBps: z.number().int().nonnegative().default(250),
     /** Top-level programs a signed Jupiter tx may call. */
     solanaProgramAllowlist: z.array(z.string().min(32)).default(DEFAULT_SOLANA_PROGRAM_ALLOWLIST),
+    maxConsecutiveFailures: z.number().int().nonnegative().default(3),
+    maxWalletSol: z.number().positive().default(1),
+    jupiterMaxRequestsPerSec: z.number().positive().max(10).default(2),
   }),
   quote: z.object({
     solanaNative: z.string(),
@@ -159,6 +162,13 @@ export interface EnvConfig {
    * is skipped (labeled dryRunSellSim=no_public_key).
    */
   dryRunSolanaPubkey?: string;
+  /** Second RPC used after the primary fails. Never logged. */
+  solanaRpcUrlSecondary?: string;
+  /**
+   * When true, a loopback RPC is a real solana-test-validator and may be
+   * simulated and signed against. Default false: loopback fails closed.
+   */
+  solanaAllowLoopback?: boolean;
   /** Optional env overrides for watchlist (applied after yaml). */
   traderSource?: TraderSource;
   leaderboardWindow?: LeaderboardWindow;
@@ -216,6 +226,8 @@ export function loadEnv(): EnvConfig {
     fomoApiKey: process.env.FOMO_API_KEY?.trim() ?? "",
     dryRun: envBool(process.env.DRY_RUN, true),
     solanaRpcUrl: process.env.SOLANA_RPC_URL ?? "https://api.mainnet-beta.solana.com",
+    solanaRpcUrlSecondary: process.env.SOLANA_RPC_URL_SECONDARY?.trim() || undefined,
+    solanaAllowLoopback: envBool(process.env.SOLANA_ALLOW_LOOPBACK, false),
     solanaPrivateKey: process.env.SOLANA_PRIVATE_KEY?.trim() ?? "",
     jupiterApiKey: process.env.JUPITER_API_KEY?.trim() ?? "",
     baseRpcUrl: process.env.BASE_RPC_URL ?? "https://mainnet.base.org",
@@ -303,7 +315,75 @@ export function weakenedSafetySettings(cfg: AppConfig): string[] {
   if (cfg.risk.dailyBudgetUsd > 40) {
     weakened.push(`dailyBudgetUsd ${cfg.risk.dailyBudgetUsd} > 40`);
   }
+  if (!(cfg.risk.dailyLossLimitUsd > 0) || cfg.risk.dailyLossLimitUsd > 20) {
+    weakened.push(`dailyLossLimitUsd ${cfg.risk.dailyLossLimitUsd} outside 0.01..20`);
+  }
+  if (!(cfg.risk.maxSlippageBps > 0) || cfg.risk.maxSlippageBps > 300) {
+    weakened.push(`maxSlippageBps ${cfg.risk.maxSlippageBps} outside 1..300`);
+  }
+  const ladder = cfg.risk.sellSlippageBps ?? [];
+  if (!ladder.length || ladder.some((bps) => bps > 2500)) {
+    weakened.push(`sellSlippageBps ${ladder.join(",")} has a rung above 2500`);
+  }
+  if (!(cfg.risk.trailingStopPct > 0) || cfg.risk.trailingStopPct > 20) {
+    weakened.push(`trailingStopPct ${cfg.risk.trailingStopPct} outside 1..20`);
+  }
+  if (!cfg.filters.blockTransferHooks) weakened.push("blockTransferHooks is off");
+  if (!(cfg.filters.maxTransferFeeBps > 0) || cfg.filters.maxTransferFeeBps > 100) {
+    weakened.push(`maxTransferFeeBps ${cfg.filters.maxTransferFeeBps} outside 1..100`);
+  }
+  if (!(cfg.filters.minPairAgeSec > 0)) {
+    weakened.push(`minPairAgeSec ${cfg.filters.minPairAgeSec} disables the age check`);
+  }
+  if (!(cfg.risk.maxChaseBps > 0) || cfg.risk.maxChaseBps > 500) {
+    weakened.push(`maxChaseBps ${cfg.risk.maxChaseBps} outside 1..500`);
+  }
+  if (!(cfg.leaderboard.autoDropNegativePnl)) weakened.push("autoDropNegativePnl is off");
+  if (cfg.leaderboard.autoDropMinCloses > 3) {
+    weakened.push(`autoDropMinCloses ${cfg.leaderboard.autoDropMinCloses} > 3`);
+  }
+  if (cfg.risk.quoteFailWriteoffCount > 5) {
+    weakened.push(`quoteFailWriteoffCount ${cfg.risk.quoteFailWriteoffCount} > 5`);
+  }
+  if (!cfg.risk.copySells) weakened.push("copySells is off");
+  if (!cfg.risk.closeEmptyTokenAccount) weakened.push("closeEmptyTokenAccount is off");
+  if ((cfg.risk.simMaxExtraTokenOutflow ?? 0) > 0) {
+    weakened.push(`simMaxExtraTokenOutflow ${cfg.risk.simMaxExtraTokenOutflow} > 0`);
+  }
+  if (!(cfg.risk.maxConsecutiveFailures > 0) || cfg.risk.maxConsecutiveFailures > 3) {
+    weakened.push(`maxConsecutiveFailures ${cfg.risk.maxConsecutiveFailures} outside 1..3`);
+  }
+  if (!(cfg.risk.maxWalletSol > 0) || cfg.risk.maxWalletSol > 1) {
+    weakened.push(`maxWalletSol ${cfg.risk.maxWalletSol} > 1`);
+  }
+  if ((cfg.risk.solPriceDivergenceBps ?? 0) <= 0 || cfg.risk.solPriceDivergenceBps > 250) {
+    weakened.push(`solPriceDivergenceBps ${cfg.risk.solPriceDivergenceBps} outside 1..250`);
+  }
+  if ((cfg.risk.inUsdToleranceBps ?? 0) > 200) {
+    weakened.push(`inUsdToleranceBps ${cfg.risk.inUsdToleranceBps} > 200`);
+  }
+  if ((cfg.filters.fakeLiquidityImpactBps ?? 0) > 1000) {
+    weakened.push(`fakeLiquidityImpactBps ${cfg.filters.fakeLiquidityImpactBps} > 1000`);
+  }
+  if ((cfg.risk.simMaxExtraLamports ?? 0) > 50_000) {
+    weakened.push(`simMaxExtraLamports ${cfg.risk.simMaxExtraLamports} > 50000`);
+  }
+  if ((cfg.risk.simMaxFeeLamports ?? 0) > 1_000_000) {
+    weakened.push(`simMaxFeeLamports ${cfg.risk.simMaxFeeLamports} > 1000000`);
+  }
+  if (!cfg.risk.solanaProgramAllowlist?.length) weakened.push("solanaProgramAllowlist is empty");
+  if (cfg.risk.cooldownSeconds <= 0) weakened.push("cooldownSeconds is 0");
+  if (cfg.risk.maxOpenPositions > 10) {
+    weakened.push(`maxOpenPositions ${cfg.risk.maxOpenPositions} > 10`);
+  }
   return weakened;
+}
+
+export function assertLiveSafety(cfg: AppConfig): void {
+  const weakened = weakenedSafetySettings(cfg);
+  if (weakened.length) {
+    throw new Error(`LIVE refused: safety settings weaker than the committed floor: ${weakened.join("; ")}`);
+  }
 }
 
 export function loadAppConfig(configPath: string, env?: EnvConfig): AppConfig {
@@ -351,6 +431,8 @@ export function loadAppConfig(configPath: string, env?: EnvConfig): AppConfig {
       throw new Error(`LIVE refused: safety settings weaker than the committed floor: ${detail}`);
     }
     log.warn(`DRY_RUN safety settings weaker than the committed floor: ${detail}`);
+  } else if (env?.dryRun === false) {
+    assertLiveSafety(parsed);
   }
 
   return parsed;

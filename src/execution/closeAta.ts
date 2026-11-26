@@ -10,6 +10,7 @@ import {
   TransactionInstruction,
   sendAndConfirmTransaction,
 } from "@solana/web3.js";
+import { assertLiveAllowed } from "../security/dryRunGuard.js";
 import { rpcConnection } from "../utils/http.js";
 import {
   TOKEN_2022_PROGRAM_ID,
@@ -84,11 +85,13 @@ export async function closeEmptyTokenAccount(opts: {
       programId: program,
     });
     const tx = new Transaction().add(ix);
+    assertLiveAllowed();
     const signature = opts.send
       ? await opts.send(tx, opts.owner)
       : await sendAndConfirmTransaction(conn, tx, [opts.owner], { commitment: "confirmed" });
     return { ok: true, closed: true, rentLamports, signature };
   } catch (e) {
+    if (e instanceof Error && e.message.includes("DRY_RUN guard")) throw e;
     return {
       ok: false,
       closed: false,

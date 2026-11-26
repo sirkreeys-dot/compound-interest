@@ -73,6 +73,15 @@ function logLine(kind: string, mint: string, reason: string, detail: string): vo
 
 async function main(): Promise<void> {
   if (!fs.existsSync(KEY_PATH)) throw new Error(`missing throwaway key file ${KEY_PATH}`);
+  let host = "";
+  try {
+    host = new URL(RPC).hostname;
+  } catch {
+    throw new Error("local validator harness: RPC URL is not loopback");
+  }
+  if (host !== "127.0.0.1" && host !== "localhost" && host !== "::1") {
+    throw new Error("local validator harness: refusing non-loopback RPC");
+  }
   process.env.DRY_RUN = "false";
   cli("solana", ["config", "set", "--url", RPC, "--keypair", KEY_PATH, "-C", "/tmp/solana-cli.yml"]);
   const secret = Uint8Array.from(JSON.parse(fs.readFileSync(KEY_PATH, "utf8")) as number[]);

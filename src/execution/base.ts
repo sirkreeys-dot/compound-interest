@@ -314,6 +314,7 @@ export class BaseExecutor implements Executor {
       args: [this.account.address, spender],
     })) as bigint;
     if (current >= amount) return;
+    assertLiveAllowed();
     log.info(`Approving 0x spender ${spender} for token ${token.slice(0, 10)}…`);
     const hash = await this.walletClient.writeContract({
       address: token,

@@ -12,7 +12,7 @@ import {
   inspectSwapInstructions,
 } from "../security/programAllowlist.js";
 import { assertLiveAllowed } from "../security/dryRunGuard.js";
-import { getJupiterLimiter, jupiterFetch, type JupiterPriority } from "./jupiterLimit.js";
+import { jupiterFetch, type JupiterPriority } from "./jupiterLimit.js";
 import { EXECUTE_TIMEOUT_MS, QUOTE_TIMEOUT_MS, fetchRetry, fetchTimeout, isLoopbackRpc, rpcConnection, withRpcFailover } from "../utils/http.js";
 import { afterBlockhashCheck, outAmountDiverged, sameMessageBytes } from "../security/simGap.js";
 import { enforcedOverheadCap, overheadRejection, sumOverheadLamports } from "../security/overhead.js";
@@ -162,6 +162,7 @@ export class SolanaExecutor implements Executor {
 
   /** Close the empty ATA for `mint` and reclaim rent. Live Solana only. */
   async reclaimRent(mint: string): Promise<{ ok: boolean; rentLamports?: number; error?: string }> {
+    assertLiveAllowed();
     if (!this.keypair) return { ok: false, error: "no keypair" };
     const result = await closeEmptyTokenAccount({
       rpcUrl: this.rpcUrl,
@@ -433,6 +434,7 @@ export class SolanaExecutor implements Executor {
           payer: new PublicKey(opts.taker),
           lookupTables: tables.tables,
           recentBlockhash: new PublicKey(opts.taker).toBase58(),
+          outputMint: new PublicKey(opts.buyMint),
         });
         return { ok: true, tx };
       } catch (e) {
@@ -1132,15 +1134,19 @@ export class SolanaExecutor implements Executor {
       }
 
       assertLiveAllowed();
-      await getJupiterLimiter().acquire(side === "sell" ? "sell" : "buy");
-      const execRes = await fetchTimeout(
+      const execRes = await jupiterFetch(
         `${JUP_BASE}/execute`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json", ...headers },
           body: JSON.stringify({ signedTransaction: signed, requestId: liveOrder.requestId }),
         },
-        EXECUTE_TIMEOUT_MS,
+        {
+          apiKey: this.apiKey,
+          priority: side === "sell" ? "sell" : "buy",
+          retry429: false,
+          timeoutMs: EXECUTE_TIMEOUT_MS,
+        },
       );
       if (!execRes.ok) {
         const t = await execRes.text();

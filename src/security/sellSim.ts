@@ -7,6 +7,7 @@
 import {
   ComputeBudgetProgram,
   PublicKey,
+  SystemProgram,
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
@@ -143,6 +144,66 @@ export function instructionsFromSwapBody(body: SwapInstructionsBody): Transactio
   return raw.map(jupiterInstruction);
 }
 
+const ATA_PROGRAM = new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const TOKEN_PROGRAM = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+const TOKEN_2022_PROGRAM = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
+
+function tokenProgramUsed(ixs: TransactionInstruction[]): PublicKey {
+  for (const ix of ixs) {
+    if (ix.programId.equals(TOKEN_2022_PROGRAM)) return TOKEN_2022_PROGRAM;
+    if (ix.keys.some((key) => key.pubkey.equals(TOKEN_2022_PROGRAM))) return TOKEN_2022_PROGRAM;
+  }
+  return TOKEN_PROGRAM;
+}
+
+function ataAddress(owner: PublicKey, mint: PublicKey, tokenProgram: PublicKey): PublicKey {
+  return PublicKey.findProgramAddressSync(
+    [owner.toBuffer(), tokenProgram.toBuffer(), mint.toBuffer()],
+    ATA_PROGRAM,
+  )[0];
+}
+
+/** CreateIdempotent (discriminator 1) so a combined sell sees the buy's output account. */
+export function createAtaIdempotentIx(
+  payer: PublicKey,
+  mint: PublicKey,
+  tokenProgram: PublicKey,
+): TransactionInstruction {
+  return new TransactionInstruction({
+    programId: ATA_PROGRAM,
+    keys: [
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: ataAddress(payer, mint, tokenProgram), isSigner: false, isWritable: true },
+      { pubkey: payer, isSigner: false, isWritable: false },
+      { pubkey: mint, isSigner: false, isWritable: false },
+      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+      { pubkey: tokenProgram, isSigner: false, isWritable: false },
+    ],
+    data: Buffer.from([1]),
+  });
+}
+
+export function ensureAtaCreates(
+  payer: PublicKey,
+  outputMint: PublicKey | undefined,
+  ixs: TransactionInstruction[],
+): TransactionInstruction[] {
+  if (!outputMint) return [];
+  const program = tokenProgramUsed(ixs);
+  const needed = [WSOL_MINT, outputMint];
+  const creates: TransactionInstruction[] = [];
+  for (const mint of needed) {
+    const tokenProgram = mint.equals(WSOL_MINT) ? TOKEN_PROGRAM : program;
+    const ata = ataAddress(payer, mint, tokenProgram);
+    const present = ixs.some(
+      (ix) => ix.programId.equals(ATA_PROGRAM) && ix.keys.some((key) => key.pubkey.equals(ata)),
+    );
+    if (!present) creates.push(createAtaIdempotentIx(payer, mint, tokenProgram));
+  }
+  return creates;
+}
+
 /**
  * One unsigned v0 transaction: buy instructions, then sell instructions.
  * The caller simulates it with sigVerify false and replaceRecentBlockhash true.
@@ -153,12 +214,15 @@ export function compileRoundTripForSim(opts: {
   payer: PublicKey;
   lookupTables?: AddressLookupTableAccount[];
   recentBlockhash: string;
+  /** Output mint of the buy. A missing ATA create is inserted so the sell leg has an account. */
+  outputMint?: PublicKey;
 }): { tx: VersionedTransaction; bytes: number } {
-  const instructions = dedupeInstructions([
+  const instructions = [
     ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
-    ...opts.buyIxs,
-    ...opts.sellIxs,
-  ]);
+    ...ensureAtaCreates(opts.payer, opts.outputMint, [...opts.buyIxs, ...opts.sellIxs]),
+    ...dedupeInstructions(opts.buyIxs),
+    ...dedupeInstructions(opts.sellIxs),
+  ];
   const tables: AddressLookupTableAccount[] = [];
   const seenTables = new Set<string>();
   for (const table of opts.lookupTables ?? []) {
@@ -227,6 +291,11 @@ export function classifySellSimulation(err: unknown, logs?: string[] | null): Se
   if (code != null && JUPITER_INCONCLUSIVE.has(code)) return "inconclusive";
   const text = `${JSON.stringify(err)}\n${(logs ?? []).join("\n")}`.toLowerCase();
   if (
+    /invalidaccountdata|accountnotinitialized|uninitializedaccount|uninitializedstate/i.test(text)
+  ) {
+    return "inconclusive";
+  }
+  if (
     text.includes("insufficient") ||
     text.includes("accountnotfound") ||
     text.includes("account not found") ||
@@ -240,7 +309,9 @@ export function classifySellSimulation(err: unknown, logs?: string[] | null): Se
     text.includes("account is frozen") ||
     text.includes("accountfrozen") ||
     text.includes("transfer hook") ||
-    text.includes("transferhook")
+    text.includes("transferhook") ||
+    text.includes("non-transferable") ||
+    text.includes("nontransferable")
   ) {
     return "honeypot";
   }

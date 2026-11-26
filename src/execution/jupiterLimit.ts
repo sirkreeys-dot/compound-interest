@@ -134,16 +134,25 @@ export function sleepRateLimit(ms: number): Promise<void> {
   return sleepImpl(ms);
 }
 
-const RATE_LIMIT_ATTEMPTS = 3;
+const RATE_LIMIT_ATTEMPTS = 5;
 const QUOTE_CACHE_MS = 4_000;
 
 type CachedGet = { at: number; status: number; body: string };
 const getCache = new Map<string, CachedGet>();
 
-function cacheableGet(url: string, method: string): boolean {
-  if (method !== "GET") return false;
+function requestBody(body: RequestInit["body"]): string {
+  if (body == null) return "";
+  if (typeof body === "string") return body;
+  return "";
+}
+
+/** Idempotent quote, price, and swap-instructions reads. Never a signed execute. */
+export function cacheableJupiterRequest(url: string, method: string, body: string): boolean {
   if (url.includes("/execute")) return false;
-  return url.includes("/quote") || url.includes("/price/");
+  if (body.includes("signedTransaction")) return false;
+  if (method === "GET" && (url.includes("/quote") || url.includes("/price/"))) return true;
+  if (method === "POST" && url.includes("/swap-instructions")) return true;
+  return false;
 }
 
 /** Add up to 250ms so retries do not line up. The base delay stays capped at 8s. */
@@ -163,16 +172,20 @@ export async function jupiterFetch(
     apiKey?: string;
     priority: JupiterPriority;
     fetchImpl?: typeof fetch;
-    /** Sells leave 429s to the slippage ladder so a rung is not retried twice. */
+    /** Sells and /execute leave 429s unretried so a signed transaction is not sent again. */
     retry429?: boolean;
     limiter?: JupiterLimiter;
+    timeoutMs?: number;
   },
 ): Promise<Response> {
   const limiter = opts.limiter ?? getJupiterLimiter();
   const headers = jupiterHeaders(opts.apiKey, init.headers);
   const method = (init.method ?? "GET").toUpperCase();
-  const cacheKey = `${method} ${input}`;
-  const useCache = cacheableGet(input, method) && (opts.fetchImpl == null || opts.fetchImpl === globalThis.fetch);
+  const body = requestBody(init.body);
+  const cacheKey = `${method} ${input} ${body}`;
+  const useCache =
+    cacheableJupiterRequest(input, method, body) &&
+    (opts.fetchImpl == null || opts.fetchImpl === globalThis.fetch);
   if (useCache) {
     const hit = getCache.get(cacheKey);
     if (hit && Date.now() - hit.at < QUOTE_CACHE_MS) {
@@ -186,7 +199,12 @@ export async function jupiterFetch(
     last = await fetchRetry(
       input,
       { ...init, method, headers },
-      { timeoutMs: QUOTE_TIMEOUT_MS, retries: 2, fetchImpl: opts.fetchImpl, retry429: false },
+      {
+        timeoutMs: opts.timeoutMs ?? QUOTE_TIMEOUT_MS,
+        retries: 2,
+        fetchImpl: opts.fetchImpl,
+        retry429: false,
+      },
     );
     if (last.status !== 429 || attempt === attempts - 1) break;
     const base = rateLimitBackoffMs(attempt, last.headers.get("retry-after"));

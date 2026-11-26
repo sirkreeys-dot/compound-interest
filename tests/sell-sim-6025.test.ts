@@ -108,7 +108,7 @@ describe("429 is rate_limited", () => {
         }) as typeof fetch,
       });
       assert.equal(res.status, 429);
-      assert.equal(limited, 3);
+      assert.equal(limited, 5);
     } finally {
       globalThis.fetch = original;
       setRateLimitSleepForTests(null);
